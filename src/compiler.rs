@@ -6,7 +6,7 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue};
+use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, GlobalValue, PointerValue};
 use wasmparser::{Operator, ValType};
 
 use crate::wasm_parser::{Function, WasmModule};
@@ -16,6 +16,7 @@ pub struct Compiler<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     execution_engine: ExecutionEngine<'ctx>,
+    memory: Option<GlobalValue<'ctx>>,
 }
 
 impl<'ctx> Compiler<'ctx> {
@@ -33,10 +34,15 @@ impl<'ctx> Compiler<'ctx> {
             module,
             builder: context.create_builder(),
             execution_engine,
+            memory: None,
         })
     }
 
-    pub fn compile_module(&self, wasm_module: &WasmModule) -> Result<()> {
+    pub fn compile_module(&mut self, wasm_module: &WasmModule) -> Result<()> {
+        if !wasm_module.memories.is_empty() {
+            self.create_memory(&wasm_module.memories[0])?;
+        }
+
         for function in &wasm_module.functions {
             self.compile_function(function)?;
         }
@@ -194,6 +200,60 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder.build_return(Some(&return_value)).unwrap();
                     }
                 }
+                Operator::I32Load { memarg } => {
+                    let offset = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+                    let value = self
+                        .builder
+                        .build_load(self.context.i32_type(), ptr, "load")
+                        .unwrap();
+                    value_stack.push(value);
+                }
+                Operator::I32Store { memarg } => {
+                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    let offset = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+                    self.builder.build_store(ptr, value).unwrap();
+                }
+                Operator::I64Load { memarg } => {
+                    let offset = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+                    let value = self
+                        .builder
+                        .build_load(self.context.i64_type(), ptr, "load")
+                        .unwrap();
+                    value_stack.push(value);
+                }
+                Operator::I64Store { memarg } => {
+                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    let offset = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+                    self.builder.build_store(ptr, value).unwrap();
+                }
+                Operator::MemorySize { .. } => {
+                    let pages = self.get_memory_size()?;
+                    value_stack.push(pages.into());
+                }
+                Operator::MemoryGrow { .. } => {
+                    let delta = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self.grow_memory(delta)?;
+                    value_stack.push(result.into());
+                }
                 _ => return Err(anyhow!("Unsupported operator: {:?}", operator)),
             }
         }
@@ -228,6 +288,79 @@ impl<'ctx> Compiler<'ctx> {
             ValType::I64 => self.context.i64_type().into(),
             _ => panic!("Unsupported value type: {:?}", val_type),
         }
+    }
+
+    fn create_memory(&mut self, memory_type: &wasmparser::MemoryType) -> Result<()> {
+        let i8_type = self.context.i8_type();
+        let _i32_type = self.context.i32_type();
+        let page_size = 65536;
+        let initial_size = memory_type.initial * page_size;
+
+        let array_type = i8_type.array_type(initial_size as u32);
+        let memory_global = self.module.add_global(array_type, None, "memory");
+        let zero_initializer = array_type.const_zero();
+        memory_global.set_initializer(&zero_initializer);
+
+        self.memory = Some(memory_global);
+        Ok(())
+    }
+
+    fn get_memory_ptr(
+        &self,
+        offset: inkwell::values::IntValue<'ctx>,
+        static_offset: u64,
+    ) -> Result<PointerValue<'ctx>> {
+        let memory = self.memory.ok_or(anyhow!("No memory allocated"))?;
+        let i32_type = self.context.i32_type();
+
+        let base_ptr = memory.as_pointer_value();
+        let _zero = i32_type.const_zero();
+        let offset_with_static = if static_offset > 0 {
+            let static_offset_val = i32_type.const_int(static_offset, false);
+            self.builder
+                .build_int_add(offset, static_offset_val, "offset_sum")
+                .unwrap()
+        } else {
+            offset
+        };
+
+        let i8_ptr = self
+            .builder
+            .build_bit_cast(
+                base_ptr,
+                self.context.ptr_type(inkwell::AddressSpace::default()),
+                "mem_base",
+            )
+            .unwrap()
+            .into_pointer_value();
+
+        let ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    i8_ptr,
+                    &[offset_with_static],
+                    "mem_ptr",
+                )
+                .unwrap()
+        };
+        Ok(ptr)
+    }
+
+    fn get_memory_size(&self) -> Result<inkwell::values::IntValue<'ctx>> {
+        let memory = self.memory.ok_or(anyhow!("No memory allocated"))?;
+        let memory_type = memory.get_value_type().into_array_type();
+        let size_in_bytes = memory_type.len();
+        let pages = size_in_bytes / 65536;
+        Ok(self.context.i32_type().const_int(pages as u64, false))
+    }
+
+    fn grow_memory(
+        &self,
+        _delta: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>> {
+        let neg_one = self.context.i32_type().const_int((-1i64) as u64, true);
+        Ok(neg_one)
     }
 
     pub fn run_main(&self) -> Result<i32> {
@@ -389,11 +522,12 @@ mod tests {
     #[test]
     fn test_compile_empty_module() {
         let context = Context::create();
-        let compiler = Compiler::new(&context, "test").unwrap();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
 
         let module = WasmModule {
             functions: vec![],
             start_func_idx: None,
+            memories: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -410,5 +544,92 @@ mod tests {
         let function = create_simple_function(0, operators);
         let result = compiler.compile_function(&function);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compile_module_with_memory() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![memory_type],
+        };
+
+        let result = compiler.compile_module(&module);
+        assert!(result.is_ok());
+        assert!(compiler.memory.is_some());
+    }
+
+    #[test]
+    fn test_memory_load_store_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 2,
+            max_align: 2,
+            offset: 0,
+            memory: 0,
+        };
+
+        let operators = vec![
+            Operator::I32Const { value: 0 },
+            Operator::I32Const { value: 42 },
+            Operator::I32Store { memarg },
+            Operator::I32Const { value: 0 },
+            Operator::I32Load { memarg },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_memory_size_operation() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let operators = vec![
+            Operator::MemorySize { mem: 0 },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
     }
 }

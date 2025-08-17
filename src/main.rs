@@ -59,7 +59,7 @@ fn exec_command(wasm_file: &str) -> Result<()> {
     let wasm_module = WasmModule::parse(&wasm_bytes)?;
 
     let context = Context::create();
-    let compiler = Compiler::new(&context, "wasm_aot")?;
+    let mut compiler = Compiler::new(&context, "wasm_aot")?;
 
     compiler.compile_module(&wasm_module)?;
 
@@ -72,7 +72,7 @@ fn compile_command(wasm_file: &str, output_file: &str) -> Result<()> {
     let wasm_module = WasmModule::parse(&wasm_bytes)?;
 
     let context = Context::create();
-    let compiler = Compiler::new(&context, "wasm_aot")?;
+    let mut compiler = Compiler::new(&context, "wasm_aot")?;
 
     compiler.compile_module(&wasm_module)?;
     compiler.write_object_file(output_file)?;
@@ -86,7 +86,7 @@ fn ir_command(wasm_file: &str, output_file: Option<&str>) -> Result<()> {
     let wasm_module = WasmModule::parse(&wasm_bytes)?;
 
     let context = Context::create();
-    let compiler = Compiler::new(&context, "wasm_aot")?;
+    let mut compiler = Compiler::new(&context, "wasm_aot")?;
 
     compiler.compile_module(&wasm_module)?;
 

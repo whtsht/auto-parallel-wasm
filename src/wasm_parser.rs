@@ -1,9 +1,10 @@
 use anyhow::Result;
-use wasmparser::{FuncType, Operator, Parser, Payload, TypeRef, ValType};
+use wasmparser::{FuncType, MemoryType, Operator, Parser, Payload, TypeRef, ValType};
 
 pub struct WasmModule {
     pub functions: Vec<Function>,
     pub start_func_idx: Option<u32>,
+    pub memories: Vec<MemoryType>,
 }
 
 pub struct Function {
@@ -25,6 +26,7 @@ impl WasmModule {
         let mut func_types = Vec::new();
         let mut func_bodies = Vec::new();
         let mut import_count = 0;
+        let mut memories = Vec::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
             match payload? {
@@ -66,6 +68,11 @@ impl WasmModule {
                 Payload::StartSection { func, .. } => {
                     start_func_idx = Some(func);
                 }
+                Payload::MemorySection(memory_section) => {
+                    for memory in memory_section {
+                        memories.push(memory?);
+                    }
+                }
                 Payload::CodeSectionEntry(body) => {
                     func_bodies.push(body);
                 }
@@ -88,7 +95,6 @@ impl WasmModule {
                 let operators_reader = body.get_operators_reader()?;
                 for op in operators_reader {
                     let op = op?;
-                    // Convert borrowed Operator to owned
                     let owned_op = match op {
                         Operator::I32Const { value } => Operator::I32Const { value },
                         Operator::I64Const { value } => Operator::I64Const { value },
@@ -97,10 +103,16 @@ impl WasmModule {
                         Operator::I32Mul => Operator::I32Mul,
                         Operator::I32DivS => Operator::I32DivS,
                         Operator::LocalGet { local_index } => Operator::LocalGet { local_index },
+                        Operator::I32Load { memarg } => Operator::I32Load { memarg },
+                        Operator::I32Store { memarg } => Operator::I32Store { memarg },
+                        Operator::I64Load { memarg } => Operator::I64Load { memarg },
+                        Operator::I64Store { memarg } => Operator::I64Store { memarg },
+                        Operator::MemorySize { mem, .. } => Operator::MemorySize { mem },
+                        Operator::MemoryGrow { mem, .. } => Operator::MemoryGrow { mem },
                         Operator::Return => Operator::Return,
                         Operator::End => Operator::End,
                         Operator::Drop => Operator::Drop,
-                        _ => continue, // Skip unsupported operators for now
+                        _ => continue,
                     };
                     operators.push(owned_op);
                 }
@@ -119,6 +131,7 @@ impl WasmModule {
         Ok(WasmModule {
             functions,
             start_func_idx,
+            memories,
         })
     }
 }
@@ -137,6 +150,7 @@ mod tests {
         let module = result.unwrap();
         assert!(module.functions.is_empty());
         assert!(module.start_func_idx.is_none());
+        assert!(module.memories.is_empty());
     }
 
     #[test]
