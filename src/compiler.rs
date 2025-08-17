@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use inkwell::OptimizationLevel;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
@@ -17,6 +18,20 @@ extern "C" fn putchar_wrapper(c: i32) -> i32 {
     use std::io::{self, Write};
     io::stdout().flush().unwrap();
     c
+}
+
+#[derive(Clone)]
+struct ControlBlock<'ctx> {
+    block_type: ControlBlockType,
+    end_block: BasicBlock<'ctx>,
+    continue_block: Option<BasicBlock<'ctx>>,
+}
+
+#[derive(Clone)]
+enum ControlBlockType {
+    Block,
+    Loop,
+    If,
 }
 
 pub struct Compiler<'ctx> {
@@ -96,6 +111,7 @@ impl<'ctx> Compiler<'ctx> {
 
         let mut value_stack: Vec<BasicValueEnum<'ctx>> = Vec::new();
         let mut locals: Vec<BasicValueEnum<'ctx>> = Vec::new();
+        let mut control_stack: Vec<ControlBlock<'ctx>> = Vec::new();
 
         for (i, _) in function.func_type.params().iter().enumerate() {
             locals.push(llvm_func.get_nth_param(i as u32).unwrap());
@@ -194,6 +210,120 @@ impl<'ctx> Compiler<'ctx> {
                     let result = self.builder.build_int_signed_rem(lhs, rhs, "rem").unwrap();
                     value_stack.push(result.into());
                 }
+                Operator::I32LtS => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::SLT, lhs, rhs, "lt")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "lt_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32LeS => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::SLE, lhs, rhs, "le")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "le_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32GtS => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::SGT, lhs, rhs, "gt")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "gt_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32GeS => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::SGE, lhs, rhs, "ge")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "ge_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32Eq => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::EQ, lhs, rhs, "eq")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "eq_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32Ne => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::NE, lhs, rhs, "ne")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "ne_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
                 Operator::LocalGet { local_index } => {
                     let local_ptr = locals
                         .get(*local_index as usize)
@@ -234,16 +364,6 @@ impl<'ctx> Compiler<'ctx> {
                 }
                 Operator::Drop => {
                     value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
-                }
-                Operator::End => {
-                    if function.func_type.results().is_empty() {
-                        self.builder.build_return(None).unwrap();
-                    } else {
-                        let return_value = value_stack
-                            .pop()
-                            .ok_or(anyhow!("No return value on stack"))?;
-                        self.builder.build_return(Some(&return_value)).unwrap();
-                    }
                 }
                 Operator::I32Load { memarg } => {
                     let offset = value_stack
@@ -355,6 +475,156 @@ impl<'ctx> Compiler<'ctx> {
                         } else {
                             return Err(anyhow!("Unknown function: {}", func_name));
                         }
+                    }
+                }
+                Operator::If { .. } => {
+                    let condition = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow for if condition"))?
+                        .into_int_value();
+
+                    let then_block = self.context.append_basic_block(llvm_func, "if_then");
+                    let else_block = self.context.append_basic_block(llvm_func, "if_else");
+                    let merge_block = self.context.append_basic_block(llvm_func, "if_merge");
+
+                    let zero = self.context.i32_type().const_zero();
+                    let cond = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::NE, condition, zero, "if_cond")
+                        .unwrap();
+
+                    self.builder
+                        .build_conditional_branch(cond, then_block, else_block)
+                        .unwrap();
+
+                    control_stack.push(ControlBlock {
+                        block_type: ControlBlockType::If,
+                        end_block: merge_block,
+                        continue_block: Some(else_block),
+                    });
+
+                    self.builder.position_at_end(then_block);
+                }
+                Operator::Else => {
+                    if let Some(control_block) = control_stack.last() {
+                        if matches!(control_block.block_type, ControlBlockType::If) {
+                            self.builder
+                                .build_unconditional_branch(control_block.end_block)
+                                .unwrap();
+                            if let Some(else_block) = control_block.continue_block {
+                                self.builder.position_at_end(else_block);
+                            }
+                        }
+                    }
+                }
+                Operator::Block { .. } => {
+                    let block = self.context.append_basic_block(llvm_func, "block");
+                    let end_block = self.context.append_basic_block(llvm_func, "block_end");
+
+                    self.builder.build_unconditional_branch(block).unwrap();
+                    self.builder.position_at_end(block);
+
+                    control_stack.push(ControlBlock {
+                        block_type: ControlBlockType::Block,
+                        end_block,
+                        continue_block: None,
+                    });
+                }
+                Operator::Loop { .. } => {
+                    let loop_header = self.context.append_basic_block(llvm_func, "loop_header");
+                    let loop_end = self.context.append_basic_block(llvm_func, "loop_end");
+
+                    self.builder
+                        .build_unconditional_branch(loop_header)
+                        .unwrap();
+                    self.builder.position_at_end(loop_header);
+
+                    control_stack.push(ControlBlock {
+                        block_type: ControlBlockType::Loop,
+                        end_block: loop_end,
+                        continue_block: Some(loop_header),
+                    });
+                }
+                Operator::Br { relative_depth } => {
+                    let depth = *relative_depth as usize;
+                    if depth < control_stack.len() {
+                        let target_idx = control_stack.len() - 1 - depth;
+                        let target_block = &control_stack[target_idx];
+
+                        let branch_target = match target_block.block_type {
+                            ControlBlockType::Loop => target_block.continue_block.unwrap(),
+                            _ => target_block.end_block,
+                        };
+
+                        self.builder
+                            .build_unconditional_branch(branch_target)
+                            .unwrap();
+
+                        let unreachable_block =
+                            self.context.append_basic_block(llvm_func, "unreachable");
+                        self.builder.position_at_end(unreachable_block);
+                    }
+                }
+                Operator::BrIf { relative_depth } => {
+                    let condition = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow for br_if condition"))?
+                        .into_int_value();
+
+                    let depth = *relative_depth as usize;
+                    if depth < control_stack.len() {
+                        let target_idx = control_stack.len() - 1 - depth;
+                        let target_block = &control_stack[target_idx];
+
+                        let branch_target = match target_block.block_type {
+                            ControlBlockType::Loop => target_block.continue_block.unwrap(),
+                            _ => target_block.end_block,
+                        };
+
+                        let continue_block =
+                            self.context.append_basic_block(llvm_func, "br_if_continue");
+
+                        let zero = self.context.i32_type().const_zero();
+                        let cond = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::NE,
+                                condition,
+                                zero,
+                                "br_if_cond",
+                            )
+                            .unwrap();
+
+                        self.builder
+                            .build_conditional_branch(cond, branch_target, continue_block)
+                            .unwrap();
+
+                        self.builder.position_at_end(continue_block);
+                    }
+                }
+                Operator::End => {
+                    if let Some(control_block) = control_stack.pop() {
+                        match control_block.block_type {
+                            ControlBlockType::If => {
+                                self.builder
+                                    .build_unconditional_branch(control_block.end_block)
+                                    .unwrap();
+                                self.builder.position_at_end(control_block.end_block);
+                            }
+                            ControlBlockType::Block | ControlBlockType::Loop => {
+                                self.builder
+                                    .build_unconditional_branch(control_block.end_block)
+                                    .unwrap();
+                                self.builder.position_at_end(control_block.end_block);
+                            }
+                        }
+                    } else if function.func_type.results().is_empty() {
+                        self.builder.build_return(None).unwrap();
+                    } else {
+                        let return_val = value_stack
+                            .pop()
+                            .ok_or(anyhow!("Stack underflow for return"))?;
+                        self.builder.build_return(Some(&return_val)).unwrap();
                     }
                 }
                 _ => return Err(anyhow!("Unsupported operator: {:?}", operator)),

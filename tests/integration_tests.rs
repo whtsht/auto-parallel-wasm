@@ -110,6 +110,16 @@ fn test_e2e() {
             "tests/ir/local_variables.ll",
             "tests/output/local_variables.txt",
         ),
+        (
+            "tests/wat/control_flow.wat",
+            "tests/ir/control_flow.ll",
+            "tests/output/control_flow.txt",
+        ),
+        (
+            "tests/wat/for_loop.wat",
+            "tests/ir/for_loop.ll",
+            "tests/output/for_loop.txt",
+        ),
     ];
 
     for (wat_path, ir_path, output_path) in test_cases.iter() {
