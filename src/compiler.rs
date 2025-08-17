@@ -248,6 +248,174 @@ impl<'ctx> Compiler<'ctx> {
                             .into(),
                     );
                 }
+                Operator::I64Add => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_add(lhs, rhs, "add64").unwrap()
+                    })?;
+                }
+                Operator::I64Sub => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_sub(lhs, rhs, "sub64").unwrap()
+                    })?;
+                }
+                Operator::I64Mul => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_mul(lhs, rhs, "mul64").unwrap()
+                    })?;
+                }
+                Operator::I64DivS => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_signed_div(lhs, rhs, "div64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64DivU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_unsigned_div(lhs, rhs, "divu64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64RemS => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_signed_rem(lhs, rhs, "rem64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64RemU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_unsigned_rem(lhs, rhs, "remu64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64Eq => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::EQ, "eq64")?;
+                }
+                Operator::I64Ne => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::NE, "ne64")?;
+                }
+                Operator::I64Eqz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let zero = self.context.i64_type().const_zero();
+                    let result = self
+                        .builder
+                        .build_int_compare(IntPredicate::EQ, value, zero, "eqz64")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "eqz64_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I64LtS => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SLT, "lt64")?;
+                }
+                Operator::I64LtU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::ULT, "ltu64")?;
+                }
+                Operator::I64LeS => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SLE, "le64")?;
+                }
+                Operator::I64LeU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::ULE, "leu64")?;
+                }
+                Operator::I64GtS => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SGT, "gt64")?;
+                }
+                Operator::I64GtU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::UGT, "gtu64")?;
+                }
+                Operator::I64GeS => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SGE, "ge64")?;
+                }
+                Operator::I64GeU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::UGE, "geu64")?;
+                }
+                Operator::I64And => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_and(lhs, rhs, "and64").unwrap()
+                    })?;
+                }
+                Operator::I64Or => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_or(lhs, rhs, "or64").unwrap()
+                    })?;
+                }
+                Operator::I64Xor => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_xor(lhs, rhs, "xor64").unwrap()
+                    })?;
+                }
+                Operator::I64Shl => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_left_shift(lhs, rhs, "shl64").unwrap()
+                    })?;
+                }
+                Operator::I64ShrS => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_right_shift(lhs, rhs, true, "shr_s64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64ShrU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_right_shift(lhs, rhs, false, "shr_u64")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I64Rotl => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let i64_type = self.context.i64_type();
+                    let bits = i64_type.const_int(64, false);
+                    let masked_rhs = self
+                        .builder
+                        .build_int_unsigned_rem(rhs, bits, "rotl64_mask")
+                        .unwrap();
+                    let shl = self
+                        .builder
+                        .build_left_shift(lhs, masked_rhs, "rotl64_shl")
+                        .unwrap();
+                    let inv_shift = self
+                        .builder
+                        .build_int_sub(bits, masked_rhs, "rotl64_inv")
+                        .unwrap();
+                    let shr = self
+                        .builder
+                        .build_right_shift(lhs, inv_shift, false, "rotl64_shr")
+                        .unwrap();
+                    let result = self.builder.build_or(shl, shr, "rotl64").unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I64Rotr => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let i64_type = self.context.i64_type();
+                    let bits = i64_type.const_int(64, false);
+                    let masked_rhs = self
+                        .builder
+                        .build_int_unsigned_rem(rhs, bits, "rotr64_mask")
+                        .unwrap();
+                    let shr = self
+                        .builder
+                        .build_right_shift(lhs, masked_rhs, false, "rotr64_shr")
+                        .unwrap();
+                    let inv_shift = self
+                        .builder
+                        .build_int_sub(bits, masked_rhs, "rotr64_inv")
+                        .unwrap();
+                    let shl = self
+                        .builder
+                        .build_left_shift(lhs, inv_shift, "rotr64_shl")
+                        .unwrap();
+                    let result = self.builder.build_or(shr, shl, "rotr64").unwrap();
+                    value_stack.push(result.into());
+                }
                 Operator::I32Add => {
                     self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
                         self.builder.build_int_add(lhs, rhs, "add").unwrap()
@@ -268,28 +436,149 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder.build_int_signed_div(lhs, rhs, "div").unwrap()
                     })?;
                 }
+                Operator::I32DivU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_unsigned_div(lhs, rhs, "divu")
+                            .unwrap()
+                    })?;
+                }
                 Operator::I32RemS => {
                     self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
                         self.builder.build_int_signed_rem(lhs, rhs, "rem").unwrap()
                     })?;
                 }
+                Operator::I32RemU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_int_unsigned_rem(lhs, rhs, "remu")
+                            .unwrap()
+                    })?;
+                }
                 Operator::I32LtS => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::SLT, "lt")?;
+                }
+                Operator::I32LtU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::ULT, "ltu")?;
                 }
                 Operator::I32LeS => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::SLE, "le")?;
                 }
+                Operator::I32LeU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::ULE, "leu")?;
+                }
                 Operator::I32GtS => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::SGT, "gt")?;
                 }
+                Operator::I32GtU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::UGT, "gtu")?;
+                }
                 Operator::I32GeS => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::SGE, "ge")?;
+                }
+                Operator::I32GeU => {
+                    self.build_comparison_op(&mut value_stack, IntPredicate::UGE, "geu")?;
                 }
                 Operator::I32Eq => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::EQ, "eq")?;
                 }
                 Operator::I32Ne => {
                     self.build_comparison_op(&mut value_stack, IntPredicate::NE, "ne")?;
+                }
+                Operator::I32Eqz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let zero = self.context.i32_type().const_zero();
+                    let result = self
+                        .builder
+                        .build_int_compare(IntPredicate::EQ, value, zero, "eqz")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "eqz_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::I32And => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_and(lhs, rhs, "and").unwrap()
+                    })?;
+                }
+                Operator::I32Or => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_or(lhs, rhs, "or").unwrap()
+                    })?;
+                }
+                Operator::I32Xor => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_xor(lhs, rhs, "xor").unwrap()
+                    })?;
+                }
+                Operator::I32Shl => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_left_shift(lhs, rhs, "shl").unwrap()
+                    })?;
+                }
+                Operator::I32ShrS => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_right_shift(lhs, rhs, true, "shr_s")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I32ShrU => {
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder
+                            .build_right_shift(lhs, rhs, false, "shr_u")
+                            .unwrap()
+                    })?;
+                }
+                Operator::I32Rotl => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let i32_type = self.context.i32_type();
+                    let bits = i32_type.const_int(32, false);
+                    let masked_rhs = self
+                        .builder
+                        .build_int_unsigned_rem(rhs, bits, "rotl_mask")
+                        .unwrap();
+                    let shl = self
+                        .builder
+                        .build_left_shift(lhs, masked_rhs, "rotl_shl")
+                        .unwrap();
+                    let inv_shift = self
+                        .builder
+                        .build_int_sub(bits, masked_rhs, "rotl_inv")
+                        .unwrap();
+                    let shr = self
+                        .builder
+                        .build_right_shift(lhs, inv_shift, false, "rotl_shr")
+                        .unwrap();
+                    let result = self.builder.build_or(shl, shr, "rotl").unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I32Rotr => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let i32_type = self.context.i32_type();
+                    let bits = i32_type.const_int(32, false);
+                    let masked_rhs = self
+                        .builder
+                        .build_int_unsigned_rem(rhs, bits, "rotr_mask")
+                        .unwrap();
+                    let shr = self
+                        .builder
+                        .build_right_shift(lhs, masked_rhs, false, "rotr_shr")
+                        .unwrap();
+                    let inv_shift = self
+                        .builder
+                        .build_int_sub(bits, masked_rhs, "rotr_inv")
+                        .unwrap();
+                    let shl = self
+                        .builder
+                        .build_left_shift(lhs, inv_shift, "rotr_shl")
+                        .unwrap();
+                    let result = self.builder.build_or(shr, shl, "rotr").unwrap();
+                    value_stack.push(result.into());
                 }
                 Operator::LocalGet { local_index } => {
                     let local_ptr = locals
@@ -922,6 +1211,618 @@ mod tests {
 
         let operators = vec![
             Operator::MemorySize { mem: 0 },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_eqz_operation() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 0 },
+            Operator::I32Eqz,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_unsigned_div_rem() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 20 },
+            Operator::I32Const { value: 3 },
+            Operator::I32DivU,
+            Operator::I32Const { value: 20 },
+            Operator::I32Const { value: 3 },
+            Operator::I32RemU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_unsigned_comparisons() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const {
+                value: -1i32 as u32 as i32,
+            },
+            Operator::I32Const { value: 1 },
+            Operator::I32LtU,
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 1 },
+            Operator::I32LeU,
+            Operator::I32Const {
+                value: -1i32 as u32 as i32,
+            },
+            Operator::I32Const { value: 1 },
+            Operator::I32GtU,
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 1 },
+            Operator::I32GeU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_arithmetic() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64Add,
+            Operator::I64Const { value: 500 },
+            Operator::I64Sub,
+            Operator::I64Const { value: 2 },
+            Operator::I64Mul,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_div_rem() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64DivS,
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64DivU,
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64RemS,
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64RemU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_comparisons() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 1000 },
+            Operator::I64Eq,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64Ne,
+            Operator::I64Const { value: 0 },
+            Operator::I64Eqz,
+            Operator::I64Const { value: -1 },
+            Operator::I64Const { value: 1 },
+            Operator::I64LtS,
+            Operator::I64Const {
+                value: -1i64 as u64 as i64,
+            },
+            Operator::I64Const { value: 1 },
+            Operator::I64LtU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bitwise_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32And,
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32Or,
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32Xor,
+            Operator::I64Const {
+                value: 0x0F0F0F0F0F0F0F0F,
+            },
+            Operator::I64Const {
+                value: 0xF0F0F0F0F0F0F0F0u64 as i64,
+            },
+            Operator::I64And,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_shift_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Shl,
+            Operator::I32Const { value: -16 },
+            Operator::I32Const { value: 2 },
+            Operator::I32ShrS,
+            Operator::I32Const { value: -16 },
+            Operator::I32Const { value: 2 },
+            Operator::I32ShrU,
+            Operator::I64Const { value: 1 },
+            Operator::I64Const { value: 32 },
+            Operator::I64Shl,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rotate_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 0x12345678 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Rotl,
+            Operator::I32Const { value: 0x12345678 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Rotr,
+            Operator::I64Const {
+                value: 0x123456789ABCDEF0u64 as i64,
+            },
+            Operator::I64Const { value: 8 },
+            Operator::I64Rotl,
+            Operator::I64Const {
+                value: 0x123456789ABCDEF0u64 as i64,
+            },
+            Operator::I64Const { value: 8 },
+            Operator::I64Rotr,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_eqz_comprehensive() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 0 },
+            Operator::I32Eqz,
+            Operator::I32Const { value: 42 },
+            Operator::I32Eqz,
+            Operator::I32Const { value: -1 },
+            Operator::I32Eqz,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_eqz_comprehensive() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: 0 },
+            Operator::I64Eqz,
+            Operator::I64Const {
+                value: 9223372036854775807,
+            },
+            Operator::I64Eqz,
+            Operator::I64Const { value: -1 },
+            Operator::I64Eqz,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_i32_comparison_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 10 },
+            Operator::I32Const { value: 20 },
+            Operator::I32Eq,
+            Operator::I32Const { value: 10 },
+            Operator::I32Const { value: 20 },
+            Operator::I32Ne,
+            Operator::I32Const { value: 10 },
+            Operator::I32Const { value: 20 },
+            Operator::I32LtS,
+            Operator::I32Const { value: 10 },
+            Operator::I32Const { value: 20 },
+            Operator::I32LeS,
+            Operator::I32Const { value: 20 },
+            Operator::I32Const { value: 10 },
+            Operator::I32GtS,
+            Operator::I32Const { value: 20 },
+            Operator::I32Const { value: 10 },
+            Operator::I32GeS,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_i64_comparison_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64Eq,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64Ne,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64LtS,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64LeS,
+            Operator::I64Const { value: 2000 },
+            Operator::I64Const { value: 1000 },
+            Operator::I64GtS,
+            Operator::I64Const { value: 2000 },
+            Operator::I64Const { value: 1000 },
+            Operator::I64GeS,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64LtU,
+            Operator::I64Const { value: 1000 },
+            Operator::I64Const { value: 2000 },
+            Operator::I64LeU,
+            Operator::I64Const { value: 2000 },
+            Operator::I64Const { value: 1000 },
+            Operator::I64GtU,
+            Operator::I64Const { value: 2000 },
+            Operator::I64Const { value: 1000 },
+            Operator::I64GeU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_i32_bitwise_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32And,
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32Or,
+            Operator::I32Const { value: 0x0F0F0F0F },
+            Operator::I32Const {
+                value: 0xF0F0F0F0u32 as i32,
+            },
+            Operator::I32Xor,
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Shl,
+            Operator::I32Const { value: -16 },
+            Operator::I32Const { value: 2 },
+            Operator::I32ShrS,
+            Operator::I32Const { value: -16 },
+            Operator::I32Const { value: 2 },
+            Operator::I32ShrU,
+            Operator::I32Const { value: 0x12345678 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Rotl,
+            Operator::I32Const { value: 0x12345678 },
+            Operator::I32Const { value: 4 },
+            Operator::I32Rotr,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_i64_bitwise_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const {
+                value: 0x0F0F0F0F0F0F0F0F,
+            },
+            Operator::I64Const {
+                value: 0xF0F0F0F0F0F0F0F0u64 as i64,
+            },
+            Operator::I64And,
+            Operator::I64Const {
+                value: 0x0F0F0F0F0F0F0F0F,
+            },
+            Operator::I64Const {
+                value: 0xF0F0F0F0F0F0F0F0u64 as i64,
+            },
+            Operator::I64Or,
+            Operator::I64Const {
+                value: 0x0F0F0F0F0F0F0F0F,
+            },
+            Operator::I64Const {
+                value: 0xF0F0F0F0F0F0F0F0u64 as i64,
+            },
+            Operator::I64Xor,
+            Operator::I64Const { value: 1 },
+            Operator::I64Const { value: 32 },
+            Operator::I64Shl,
+            Operator::I64Const { value: -1024 },
+            Operator::I64Const { value: 2 },
+            Operator::I64ShrS,
+            Operator::I64Const { value: -1024 },
+            Operator::I64Const { value: 2 },
+            Operator::I64ShrU,
+            Operator::I64Const {
+                value: 0x123456789ABCDEF0u64 as i64,
+            },
+            Operator::I64Const { value: 8 },
+            Operator::I64Rotl,
+            Operator::I64Const {
+                value: 0x123456789ABCDEF0u64 as i64,
+            },
+            Operator::I64Const { value: 8 },
+            Operator::I64Rotr,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_boundary_shift_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 32 },
+            Operator::I32Shl,
+            Operator::I32Const { value: 1 },
+            Operator::I32Const { value: 31 },
+            Operator::I32Shl,
+            Operator::I64Const { value: 1 },
+            Operator::I64Const { value: 64 },
+            Operator::I64Shl,
+            Operator::I64Const { value: 1 },
+            Operator::I64Const { value: 63 },
+            Operator::I64Shl,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_overflow_arithmetic() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 2147483647 },
+            Operator::I32Const { value: 1 },
+            Operator::I32Add,
+            Operator::I32Const { value: -2147483648 },
+            Operator::I32Const { value: 1 },
+            Operator::I32Sub,
+            Operator::I64Const {
+                value: 9223372036854775807,
+            },
+            Operator::I64Const { value: 1 },
+            Operator::I64Add,
+            Operator::I64Const {
+                value: -9223372036854775808,
+            },
+            Operator::I64Const { value: 1 },
+            Operator::I64Sub,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_comprehensive_instruction_coverage() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 100 },
+            Operator::I32Const { value: 3 },
+            Operator::I32RemS,
+            Operator::I32Const { value: 100 },
+            Operator::I32Const { value: 3 },
+            Operator::I32RemU,
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64RemS,
+            Operator::I64Const { value: 100 },
+            Operator::I64Const { value: 3 },
+            Operator::I64RemU,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
             Operator::Drop,
             Operator::End,
         ];

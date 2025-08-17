@@ -120,6 +120,36 @@ fn test_e2e() {
             "tests/ir/for_loop.ll",
             "tests/output/for_loop.txt",
         ),
+        (
+            "tests/wat/i32_extended.wat",
+            "tests/ir/i32_extended.ll",
+            "tests/output/i32_extended.txt",
+        ),
+        (
+            "tests/wat/i32_bitwise.wat",
+            "tests/ir/i32_bitwise.ll",
+            "tests/output/i32_bitwise.txt",
+        ),
+        (
+            "tests/wat/i64_arithmetic.wat",
+            "tests/ir/i64_arithmetic.ll",
+            "tests/output/i64_arithmetic.txt",
+        ),
+        (
+            "tests/wat/i64_comparisons.wat",
+            "tests/ir/i64_comparisons.ll",
+            "tests/output/i64_comparisons.txt",
+        ),
+        (
+            "tests/wat/i64_bitwise.wat",
+            "tests/ir/i64_bitwise.ll",
+            "tests/output/i64_bitwise.txt",
+        ),
+        (
+            "tests/wat/complex_operations.wat",
+            "tests/ir/complex_operations.ll",
+            "tests/output/complex_operations.txt",
+        ),
     ];
 
     for (wat_path, ir_path, output_path) in test_cases.iter() {
