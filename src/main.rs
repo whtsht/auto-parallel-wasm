@@ -16,21 +16,21 @@ fn main() -> Result<()> {
     match command.as_str() {
         "exec" => {
             if args.len() != 3 {
-                eprintln!("Usage: auto-parallel-wasm exec <wasm-file>");
+                eprintln!("Usage: exec <wasm-file>");
                 process::exit(1);
             }
             exec_command(&args[2])
         }
         "compile" => {
             if args.len() != 4 {
-                eprintln!("Usage: auto-parallel-wasm compile <wasm-file> <output-file>");
+                eprintln!("Usage: compile <wasm-file> <output-file>");
                 process::exit(1);
             }
             compile_command(&args[2], &args[3])
         }
         "ir" => {
             if args.len() < 3 || args.len() > 4 {
-                eprintln!("Usage: auto-parallel-wasm ir <wasm-file> [output-file]");
+                eprintln!("Usage: ir <wasm-file> [output-file]");
                 process::exit(1);
             }
             let output_file = if args.len() == 4 {
@@ -49,9 +49,9 @@ fn main() -> Result<()> {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  auto-parallel-wasm exec <wasm-file>");
-    eprintln!("  auto-parallel-wasm compile <wasm-file> <output-file>");
-    eprintln!("  auto-parallel-wasm ir <wasm-file> [output-file]");
+    eprintln!("  exec <wasm-file>");
+    eprintln!("  compile <wasm-file> <output-file>");
+    eprintln!("  ir <wasm-file> [output-file]");
 }
 
 fn exec_command(wasm_file: &str) -> Result<()> {

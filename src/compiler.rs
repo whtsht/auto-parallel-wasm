@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -7,7 +6,10 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, GlobalValue, PointerValue};
+use inkwell::values::{
+    BasicValue, BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue,
+};
+use inkwell::{IntPredicate, OptimizationLevel};
 use wasmparser::{Operator, ValType};
 
 use crate::wasm_parser::{Function, WasmModule};
@@ -81,6 +83,102 @@ impl<'ctx> Compiler<'ctx> {
         Ok(())
     }
 
+    fn build_binary_arithmetic_op<F>(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        op_builder: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>,
+    {
+        let rhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_int_value();
+        let lhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_int_value();
+        let result = op_builder(lhs, rhs);
+        value_stack.push(result.into());
+        Ok(())
+    }
+
+    fn build_comparison_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        predicate: IntPredicate,
+        op_name: &str,
+    ) -> Result<()> {
+        let rhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_int_value();
+        let lhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_int_value();
+        let result = self
+            .builder
+            .build_int_compare(predicate, lhs, rhs, op_name)
+            .unwrap();
+        let extended = self
+            .builder
+            .build_int_z_extend(result, self.context.i32_type(), &format!("{}_ext", op_name))
+            .unwrap();
+        value_stack.push(extended.into());
+        Ok(())
+    }
+
+    fn pop_single_value(
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        value_stack.pop().ok_or(anyhow!("Stack underflow"))
+    }
+
+    fn build_load_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        load_type: BasicTypeEnum<'ctx>,
+        memarg: &wasmparser::MemArg,
+    ) -> Result<()> {
+        let offset = Self::pop_single_value(value_stack)?.into_int_value();
+        let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+        let value = self.builder.build_load(load_type, ptr, "load").unwrap();
+        value_stack.push(value);
+        Ok(())
+    }
+
+    fn build_store_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        memarg: &wasmparser::MemArg,
+    ) -> Result<()> {
+        let value = Self::pop_single_value(value_stack)?;
+        let offset = Self::pop_single_value(value_stack)?.into_int_value();
+        let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+        self.builder.build_store(ptr, value).unwrap();
+        Ok(())
+    }
+
+    fn get_branch_target(
+        &self,
+        control_stack: &[ControlBlock<'ctx>],
+        relative_depth: u32,
+    ) -> Option<BasicBlock<'ctx>> {
+        let depth = relative_depth as usize;
+        if depth < control_stack.len() {
+            let target_idx = control_stack.len() - 1 - depth;
+            let target_block = &control_stack[target_idx];
+            Some(match target_block.block_type {
+                ControlBlockType::Loop => target_block.continue_block.unwrap(),
+                _ => target_block.end_block,
+            })
+        } else {
+            None
+        }
+    }
+
     fn compile_function(&self, function: &Function) -> Result<FunctionValue<'ctx>> {
         let param_types: Vec<BasicMetadataTypeEnum> = function
             .func_type
@@ -151,178 +249,47 @@ impl<'ctx> Compiler<'ctx> {
                     );
                 }
                 Operator::I32Add => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self.builder.build_int_add(lhs, rhs, "add").unwrap();
-                    value_stack.push(result.into());
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_add(lhs, rhs, "add").unwrap()
+                    })?;
                 }
                 Operator::I32Sub => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self.builder.build_int_sub(lhs, rhs, "sub").unwrap();
-                    value_stack.push(result.into());
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_sub(lhs, rhs, "sub").unwrap()
+                    })?;
                 }
                 Operator::I32Mul => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self.builder.build_int_mul(lhs, rhs, "mul").unwrap();
-                    value_stack.push(result.into());
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_mul(lhs, rhs, "mul").unwrap()
+                    })?;
                 }
                 Operator::I32DivS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self.builder.build_int_signed_div(lhs, rhs, "div").unwrap();
-                    value_stack.push(result.into());
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_signed_div(lhs, rhs, "div").unwrap()
+                    })?;
                 }
                 Operator::I32RemS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self.builder.build_int_signed_rem(lhs, rhs, "rem").unwrap();
-                    value_stack.push(result.into());
+                    self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_int_signed_rem(lhs, rhs, "rem").unwrap()
+                    })?;
                 }
                 Operator::I32LtS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::SLT, lhs, rhs, "lt")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "lt_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SLT, "lt")?;
                 }
                 Operator::I32LeS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::SLE, lhs, rhs, "le")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "le_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SLE, "le")?;
                 }
                 Operator::I32GtS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::SGT, lhs, rhs, "gt")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "gt_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SGT, "gt")?;
                 }
                 Operator::I32GeS => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::SGE, lhs, rhs, "ge")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "ge_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::SGE, "ge")?;
                 }
                 Operator::I32Eq => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::EQ, lhs, rhs, "eq")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "eq_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::EQ, "eq")?;
                 }
                 Operator::I32Ne => {
-                    let rhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let lhs = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let result = self
-                        .builder
-                        .build_int_compare(inkwell::IntPredicate::NE, lhs, rhs, "ne")
-                        .unwrap();
-                    let extended = self
-                        .builder
-                        .build_int_z_extend(result, self.context.i32_type(), "ne_ext")
-                        .unwrap();
-                    value_stack.push(extended.into());
+                    self.build_comparison_op(&mut value_stack, IntPredicate::NE, "ne")?;
                 }
                 Operator::LocalGet { local_index } => {
                     let local_ptr = locals
@@ -340,7 +307,7 @@ impl<'ctx> Compiler<'ctx> {
                     }
                 }
                 Operator::LocalSet { local_index } => {
-                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    let value = Self::pop_single_value(&mut value_stack)?;
                     let local_ptr = locals
                         .get(*local_index as usize)
                         .ok_or(anyhow!("Invalid local index: {}", local_index))?;
@@ -355,43 +322,23 @@ impl<'ctx> Compiler<'ctx> {
                     if function.func_type.results().is_empty() {
                         self.builder.build_return(None).unwrap();
                     } else {
-                        let return_value = value_stack
-                            .pop()
-                            .ok_or(anyhow!("No return value on stack"))?;
+                        let return_value = Self::pop_single_value(&mut value_stack)?;
                         self.builder.build_return(Some(&return_value)).unwrap();
                     }
                     return Ok(llvm_func);
                 }
                 Operator::Drop => {
-                    value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    Self::pop_single_value(&mut value_stack)?;
                 }
                 Operator::I32Load { memarg } => {
-                    let offset = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
-                    let value = self
-                        .builder
-                        .build_load(self.context.i32_type(), ptr, "load")
-                        .unwrap();
-                    value_stack.push(value);
+                    self.build_load_op(&mut value_stack, self.context.i32_type().into(), memarg)?;
                 }
                 Operator::I32Store { memarg } => {
-                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
-                    let offset = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
-                    self.builder.build_store(ptr, value).unwrap();
+                    self.build_store_op(&mut value_stack, memarg)?;
                 }
                 Operator::I32Store8 { memarg } => {
-                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
-                    let offset = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
+                    let value = Self::pop_single_value(&mut value_stack)?;
+                    let offset = Self::pop_single_value(&mut value_stack)?.into_int_value();
                     let ptr = self.get_memory_ptr(offset, memarg.offset)?;
                     let value_i8 = self
                         .builder
@@ -404,35 +351,17 @@ impl<'ctx> Compiler<'ctx> {
                     self.builder.build_store(ptr, value_i8).unwrap();
                 }
                 Operator::I64Load { memarg } => {
-                    let offset = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
-                    let value = self
-                        .builder
-                        .build_load(self.context.i64_type(), ptr, "load")
-                        .unwrap();
-                    value_stack.push(value);
+                    self.build_load_op(&mut value_stack, self.context.i64_type().into(), memarg)?;
                 }
                 Operator::I64Store { memarg } => {
-                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
-                    let offset = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
-                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
-                    self.builder.build_store(ptr, value).unwrap();
+                    self.build_store_op(&mut value_stack, memarg)?;
                 }
                 Operator::MemorySize { .. } => {
                     let pages = self.get_memory_size()?;
                     value_stack.push(pages.into());
                 }
                 Operator::MemoryGrow { .. } => {
-                    let delta = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow"))?
-                        .into_int_value();
+                    let delta = Self::pop_single_value(&mut value_stack)?.into_int_value();
                     let result = self.grow_memory(delta)?;
                     value_stack.push(result.into());
                 }
@@ -445,7 +374,7 @@ impl<'ctx> Compiler<'ctx> {
 
                     if (*function_index as usize) < import_count {
                         if *function_index == 0 && self.module.get_function("putchar").is_some() {
-                            let arg = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                            let arg = Self::pop_single_value(&mut value_stack)?;
                             if let Some(putchar_func) = self.module.get_function("putchar") {
                                 let call_result = self
                                     .builder
@@ -464,7 +393,7 @@ impl<'ctx> Compiler<'ctx> {
                             let param_count = func.get_type().get_param_types().len();
                             let mut args = Vec::new();
                             for _ in 0..param_count {
-                                let arg = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                                let arg = Self::pop_single_value(&mut value_stack)?;
                                 args.push(arg.into());
                             }
                             args.reverse();
@@ -546,16 +475,9 @@ impl<'ctx> Compiler<'ctx> {
                     });
                 }
                 Operator::Br { relative_depth } => {
-                    let depth = *relative_depth as usize;
-                    if depth < control_stack.len() {
-                        let target_idx = control_stack.len() - 1 - depth;
-                        let target_block = &control_stack[target_idx];
-
-                        let branch_target = match target_block.block_type {
-                            ControlBlockType::Loop => target_block.continue_block.unwrap(),
-                            _ => target_block.end_block,
-                        };
-
+                    if let Some(branch_target) =
+                        self.get_branch_target(&control_stack, *relative_depth)
+                    {
                         self.builder
                             .build_unconditional_branch(branch_target)
                             .unwrap();
@@ -566,33 +488,18 @@ impl<'ctx> Compiler<'ctx> {
                     }
                 }
                 Operator::BrIf { relative_depth } => {
-                    let condition = value_stack
-                        .pop()
-                        .ok_or(anyhow!("Stack underflow for br_if condition"))?
-                        .into_int_value();
+                    let condition = Self::pop_single_value(&mut value_stack)?.into_int_value();
 
-                    let depth = *relative_depth as usize;
-                    if depth < control_stack.len() {
-                        let target_idx = control_stack.len() - 1 - depth;
-                        let target_block = &control_stack[target_idx];
-
-                        let branch_target = match target_block.block_type {
-                            ControlBlockType::Loop => target_block.continue_block.unwrap(),
-                            _ => target_block.end_block,
-                        };
-
+                    if let Some(branch_target) =
+                        self.get_branch_target(&control_stack, *relative_depth)
+                    {
                         let continue_block =
                             self.context.append_basic_block(llvm_func, "br_if_continue");
 
                         let zero = self.context.i32_type().const_zero();
                         let cond = self
                             .builder
-                            .build_int_compare(
-                                inkwell::IntPredicate::NE,
-                                condition,
-                                zero,
-                                "br_if_cond",
-                            )
+                            .build_int_compare(IntPredicate::NE, condition, zero, "br_if_cond")
                             .unwrap();
 
                         self.builder
@@ -621,9 +528,7 @@ impl<'ctx> Compiler<'ctx> {
                     } else if function.func_type.results().is_empty() {
                         self.builder.build_return(None).unwrap();
                     } else {
-                        let return_val = value_stack
-                            .pop()
-                            .ok_or(anyhow!("Stack underflow for return"))?;
+                        let return_val = Self::pop_single_value(&mut value_stack)?;
                         self.builder.build_return(Some(&return_val)).unwrap();
                     }
                 }
