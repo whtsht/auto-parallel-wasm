@@ -7,9 +7,9 @@ use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{
-    BasicValue, BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue,
+    BasicValue, BasicValueEnum, FloatValue, FunctionValue, GlobalValue, IntValue, PointerValue,
 };
-use inkwell::{IntPredicate, OptimizationLevel};
+use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 use wasmparser::{Operator, ValType};
 
 use crate::wasm_parser::{Function, WasmModule};
@@ -130,6 +130,53 @@ impl<'ctx> Compiler<'ctx> {
         Ok(())
     }
 
+    fn build_binary_float_arithmetic_op<F>(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        op_builder: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(FloatValue<'ctx>, FloatValue<'ctx>) -> FloatValue<'ctx>,
+    {
+        let rhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_float_value();
+        let lhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_float_value();
+        let result = op_builder(lhs, rhs);
+        value_stack.push(result.into());
+        Ok(())
+    }
+
+    fn build_float_comparison_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        predicate: FloatPredicate,
+        op_name: &str,
+    ) -> Result<()> {
+        let rhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_float_value();
+        let lhs = value_stack
+            .pop()
+            .ok_or(anyhow!("Stack underflow"))?
+            .into_float_value();
+        let result = self
+            .builder
+            .build_float_compare(predicate, lhs, rhs, op_name)
+            .unwrap();
+        let extended = self
+            .builder
+            .build_int_z_extend(result, self.context.i32_type(), &format!("{}_ext", op_name))
+            .unwrap();
+        value_stack.push(extended.into());
+        Ok(())
+    }
+
     fn pop_single_value(
         value_stack: &mut Vec<BasicValueEnum<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
@@ -225,6 +272,14 @@ impl<'ctx> Compiler<'ctx> {
                     .builder
                     .build_alloca(self.context.i64_type(), "local")
                     .unwrap(),
+                ValType::F32 => self
+                    .builder
+                    .build_alloca(self.context.f32_type(), "local")
+                    .unwrap(),
+                ValType::F64 => self
+                    .builder
+                    .build_alloca(self.context.f64_type(), "local")
+                    .unwrap(),
                 _ => return Err(anyhow!("Unsupported local type: {:?}", local_type)),
             };
             locals.push(alloca.as_basic_value_enum());
@@ -247,6 +302,14 @@ impl<'ctx> Compiler<'ctx> {
                             .const_int(*value as u64, false)
                             .into(),
                     );
+                }
+                Operator::F32Const { value } => {
+                    let f32_value = f32::from_bits(value.bits());
+                    value_stack.push(self.context.f32_type().const_float(f32_value as f64).into());
+                }
+                Operator::F64Const { value } => {
+                    let f64_value = f64::from_bits(value.bits());
+                    value_stack.push(self.context.f64_type().const_float(f64_value).into());
                 }
                 Operator::I64Add => {
                     self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
@@ -415,6 +478,82 @@ impl<'ctx> Compiler<'ctx> {
                         .unwrap();
                     let result = self.builder.build_or(shr, shl, "rotr64").unwrap();
                     value_stack.push(result.into());
+                }
+                Operator::F32Add => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_add(lhs, rhs, "fadd32").unwrap()
+                    })?;
+                }
+                Operator::F32Sub => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_sub(lhs, rhs, "fsub32").unwrap()
+                    })?;
+                }
+                Operator::F32Mul => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_mul(lhs, rhs, "fmul32").unwrap()
+                    })?;
+                }
+                Operator::F32Div => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_div(lhs, rhs, "fdiv32").unwrap()
+                    })?;
+                }
+                Operator::F32Eq => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OEQ, "feq32")?;
+                }
+                Operator::F32Ne => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::ONE, "fne32")?;
+                }
+                Operator::F32Lt => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OLT, "flt32")?;
+                }
+                Operator::F32Gt => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OGT, "fgt32")?;
+                }
+                Operator::F32Le => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OLE, "fle32")?;
+                }
+                Operator::F32Ge => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OGE, "fge32")?;
+                }
+                Operator::F64Add => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_add(lhs, rhs, "fadd64").unwrap()
+                    })?;
+                }
+                Operator::F64Sub => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_sub(lhs, rhs, "fsub64").unwrap()
+                    })?;
+                }
+                Operator::F64Mul => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_mul(lhs, rhs, "fmul64").unwrap()
+                    })?;
+                }
+                Operator::F64Div => {
+                    self.build_binary_float_arithmetic_op(&mut value_stack, |lhs, rhs| {
+                        self.builder.build_float_div(lhs, rhs, "fdiv64").unwrap()
+                    })?;
+                }
+                Operator::F64Eq => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OEQ, "feq64")?;
+                }
+                Operator::F64Ne => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::ONE, "fne64")?;
+                }
+                Operator::F64Lt => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OLT, "flt64")?;
+                }
+                Operator::F64Gt => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OGT, "fgt64")?;
+                }
+                Operator::F64Le => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OLE, "fle64")?;
+                }
+                Operator::F64Ge => {
+                    self.build_float_comparison_op(&mut value_stack, FloatPredicate::OGE, "fge64")?;
                 }
                 Operator::I32Add => {
                     self.build_binary_arithmetic_op(&mut value_stack, |lhs, rhs| {
@@ -586,11 +725,25 @@ impl<'ctx> Compiler<'ctx> {
                         .ok_or(anyhow!("Invalid local index: {}", local_index))?;
                     if local_ptr.is_pointer_value() {
                         let ptr = local_ptr.into_pointer_value();
-                        let loaded = self
-                            .builder
-                            .build_load(self.context.i32_type(), ptr, "local_load")
-                            .unwrap();
-                        value_stack.push(loaded);
+                        let param_count = function.func_type.params().len();
+                        if (*local_index as usize) < param_count {
+                            let param_type = function.func_type.params()[*local_index as usize];
+                            let llvm_type = self.val_type_to_llvm_type(param_type);
+                            let loaded = self
+                                .builder
+                                .build_load(llvm_type, ptr, "local_load")
+                                .unwrap();
+                            value_stack.push(loaded);
+                        } else {
+                            let local_idx = *local_index as usize - param_count;
+                            let local_type = function.body.locals[local_idx];
+                            let llvm_type = self.val_type_to_llvm_type(local_type);
+                            let loaded = self
+                                .builder
+                                .build_load(llvm_type, ptr, "local_load")
+                                .unwrap();
+                            value_stack.push(loaded);
+                        }
                     } else {
                         value_stack.push(*local_ptr);
                     }
@@ -798,6 +951,118 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder.position_at_end(continue_block);
                     }
                 }
+                Operator::I32WrapI64 => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_truncate(value, self.context.i32_type(), "wrap_i64")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I64ExtendI32S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_s_extend(value, self.context.i64_type(), "extend_i32_s")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I64ExtendI32U => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_int_z_extend(value, self.context.i64_type(), "extend_i32_u")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F32ConvertI32S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_signed_int_to_float(value, self.context.f32_type(), "convert_i32_s")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F32ConvertI32U => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_unsigned_int_to_float(
+                            value,
+                            self.context.f32_type(),
+                            "convert_i32_u",
+                        )
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F64ConvertI32S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_signed_int_to_float(value, self.context.f64_type(), "convert_i32_s")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F64ConvertI32U => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let result = self
+                        .builder
+                        .build_unsigned_int_to_float(
+                            value,
+                            self.context.f64_type(),
+                            "convert_i32_u",
+                        )
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I32TruncF32S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_to_signed_int(value, self.context.i32_type(), "trunc_f32_s")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I32TruncF32U => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_to_unsigned_int(value, self.context.i32_type(), "trunc_f32_u")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I32TruncF64S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_to_signed_int(value, self.context.i32_type(), "trunc_f64_s")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::I32TruncF64U => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_to_unsigned_int(value, self.context.i32_type(), "trunc_f64_u")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F64PromoteF32 => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_ext(value, self.context.f64_type(), "promote_f32")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F32DemoteF64 => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self
+                        .builder
+                        .build_float_trunc(value, self.context.f32_type(), "demote_f64")
+                        .unwrap();
+                    value_stack.push(result.into());
+                }
                 Operator::End => {
                     if let Some(control_block) = control_stack.pop() {
                         match control_block.block_type {
@@ -860,6 +1125,8 @@ impl<'ctx> Compiler<'ctx> {
         match val_type {
             ValType::I32 => self.context.i32_type().into(),
             ValType::I64 => self.context.i64_type().into(),
+            ValType::F32 => self.context.f32_type().into(),
+            ValType::F64 => self.context.f64_type().into(),
             _ => panic!("Unsupported value type: {:?}", val_type),
         }
     }
@@ -1034,6 +1301,12 @@ mod tests {
 
         let i64_type = compiler.val_type_to_llvm_type(ValType::I64);
         assert!(i64_type.is_int_type());
+
+        let f32_type = compiler.val_type_to_llvm_type(ValType::F32);
+        assert!(f32_type.is_float_type());
+
+        let f64_type = compiler.val_type_to_llvm_type(ValType::F64);
+        assert!(f64_type.is_float_type());
     }
 
     #[test]
@@ -1823,6 +2096,426 @@ mod tests {
             Operator::Drop,
             Operator::Drop,
             Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_float_const_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let f32_value = std::f32::consts::PI;
+        let f64_value = std::f64::consts::E;
+
+        let operators = vec![
+            Operator::F32Const {
+                value: f32_value.into(),
+            },
+            Operator::Drop,
+            Operator::F64Const {
+                value: f64_value.into(),
+            },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_f32_arithmetic_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let f32_value_1 = 10.5f32;
+        let f32_value_2 = 2.5f32;
+
+        let operators = vec![
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Add,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Sub,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Mul,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Div,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_f64_arithmetic_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let f64_value_1 = 10.5f64;
+        let f64_value_2 = 2.5f64;
+
+        let operators = vec![
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Add,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Sub,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Mul,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Div,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_f32_comparison_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let f32_value_1 = 10.5f32;
+        let f32_value_2 = 2.5f32;
+
+        let operators = vec![
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Eq,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Ne,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Lt,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Gt,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Le,
+            Operator::F32Const {
+                value: f32_value_1.into(),
+            },
+            Operator::F32Const {
+                value: f32_value_2.into(),
+            },
+            Operator::F32Ge,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_f64_comparison_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let f64_value_1 = 10.5f64;
+        let f64_value_2 = 2.5f64;
+
+        let operators = vec![
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Eq,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Ne,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Lt,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Gt,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Le,
+            Operator::F64Const {
+                value: f64_value_1.into(),
+            },
+            Operator::F64Const {
+                value: f64_value_2.into(),
+            },
+            Operator::F64Ge,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_wrap_i64() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const {
+                value: 0x123456789ABCDEF0u64 as i64,
+            },
+            Operator::I32WrapI64,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_extend_i32() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: -1 },
+            Operator::I64ExtendI32S,
+            Operator::I32Const { value: -1 },
+            Operator::I64ExtendI32U,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_float_convert_from_int() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: -42 },
+            Operator::F32ConvertI32S,
+            Operator::I32Const { value: 42 },
+            Operator::F32ConvertI32U,
+            Operator::I32Const { value: -42 },
+            Operator::F64ConvertI32S,
+            Operator::I32Const { value: 42 },
+            Operator::F64ConvertI32U,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_int_trunc_from_float() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::F32Const {
+                value: (-42.7f32).into(),
+            },
+            Operator::I32TruncF32S,
+            Operator::F32Const {
+                value: 42.7f32.into(),
+            },
+            Operator::I32TruncF32U,
+            Operator::F64Const {
+                value: (-42.7f64).into(),
+            },
+            Operator::I32TruncF64S,
+            Operator::F64Const {
+                value: 42.7f64.into(),
+            },
+            Operator::I32TruncF64U,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_float_promotion_demotion() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::F32Const {
+                value: 3.14159f32.into(),
+            },
+            Operator::F64PromoteF32,
+            Operator::F64Const {
+                value: 2.71828f64.into(),
+            },
+            Operator::F32DemoteF64,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_type_conversion_boundary_values() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I64Const { value: i64::MAX },
+            Operator::I32WrapI64,
+            Operator::I32Const { value: i32::MAX },
+            Operator::I64ExtendI32S,
+            Operator::I32Const { value: i32::MAX },
+            Operator::I64ExtendI32U,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_comprehensive_type_conversions() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 42 },
+            Operator::F32ConvertI32S,
+            Operator::F64PromoteF32,
+            Operator::I32TruncF64S,
+            Operator::I64ExtendI32S,
+            Operator::I32WrapI64,
             Operator::Drop,
             Operator::End,
         ];

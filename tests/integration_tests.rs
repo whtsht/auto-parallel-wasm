@@ -150,6 +150,11 @@ fn test_e2e() {
             "tests/ir/complex_operations.ll",
             "tests/output/complex_operations.txt",
         ),
+        (
+            "tests/wat/type_conversions.wat",
+            "tests/ir/type_conversions.ll",
+            "tests/output/type_conversions.txt",
+        ),
     ];
 
     for (wat_path, ir_path, output_path) in test_cases.iter() {
