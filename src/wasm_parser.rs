@@ -1,11 +1,16 @@
 use anyhow::Result;
-use wasmparser::{FuncType, MemoryType, Operator, Parser, Payload, TypeRef, ValType};
+use wasmparser::{FuncType, GlobalType, MemoryType, Operator, Parser, Payload, TypeRef, ValType};
 
 pub struct WasmModule {
     pub functions: Vec<Function>,
     pub start_func_idx: Option<u32>,
     pub memories: Vec<MemoryType>,
     pub has_putchar_import: bool,
+    pub globals: Vec<WasmGlobal>,
+}
+
+pub struct WasmGlobal {
+    pub global_type: GlobalType,
 }
 
 pub struct Function {
@@ -29,6 +34,7 @@ impl WasmModule {
         let mut import_count = 0;
         let mut memories = Vec::new();
         let mut has_putchar_import = false;
+        let mut globals = Vec::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
             match payload? {
@@ -76,6 +82,14 @@ impl WasmModule {
                 Payload::MemorySection(memory_section) => {
                     for memory in memory_section {
                         memories.push(memory?);
+                    }
+                }
+                Payload::GlobalSection(global_section) => {
+                    for global in global_section {
+                        let global = global?;
+                        globals.push(WasmGlobal {
+                            global_type: global.ty,
+                        });
                     }
                 }
                 Payload::CodeSectionEntry(body) => {
@@ -179,11 +193,36 @@ impl WasmModule {
                         Operator::I32Rotr => Operator::I32Rotr,
                         Operator::LocalGet { local_index } => Operator::LocalGet { local_index },
                         Operator::LocalSet { local_index } => Operator::LocalSet { local_index },
+                        Operator::LocalTee { local_index } => Operator::LocalTee { local_index },
+                        Operator::GlobalGet { global_index } => {
+                            Operator::GlobalGet { global_index }
+                        }
+                        Operator::GlobalSet { global_index } => {
+                            Operator::GlobalSet { global_index }
+                        }
+                        Operator::F32Load { memarg } => Operator::F32Load { memarg },
+                        Operator::F64Load { memarg } => Operator::F64Load { memarg },
+                        Operator::F32Store { memarg } => Operator::F32Store { memarg },
+                        Operator::F64Store { memarg } => Operator::F64Store { memarg },
                         Operator::I32Load { memarg } => Operator::I32Load { memarg },
                         Operator::I32Store { memarg } => Operator::I32Store { memarg },
                         Operator::I32Store8 { memarg } => Operator::I32Store8 { memarg },
+                        Operator::I32Load8S { memarg } => Operator::I32Load8S { memarg },
+                        Operator::I32Load8U { memarg } => Operator::I32Load8U { memarg },
+                        Operator::I32Load16S { memarg } => Operator::I32Load16S { memarg },
+                        Operator::I32Load16U { memarg } => Operator::I32Load16U { memarg },
+                        Operator::I32Store16 { memarg } => Operator::I32Store16 { memarg },
                         Operator::I64Load { memarg } => Operator::I64Load { memarg },
                         Operator::I64Store { memarg } => Operator::I64Store { memarg },
+                        Operator::I64Load8S { memarg } => Operator::I64Load8S { memarg },
+                        Operator::I64Load8U { memarg } => Operator::I64Load8U { memarg },
+                        Operator::I64Load16S { memarg } => Operator::I64Load16S { memarg },
+                        Operator::I64Load16U { memarg } => Operator::I64Load16U { memarg },
+                        Operator::I64Load32S { memarg } => Operator::I64Load32S { memarg },
+                        Operator::I64Load32U { memarg } => Operator::I64Load32U { memarg },
+                        Operator::I64Store8 { memarg } => Operator::I64Store8 { memarg },
+                        Operator::I64Store16 { memarg } => Operator::I64Store16 { memarg },
+                        Operator::I64Store32 { memarg } => Operator::I64Store32 { memarg },
                         Operator::MemorySize { mem, .. } => Operator::MemorySize { mem },
                         Operator::MemoryGrow { mem, .. } => Operator::MemoryGrow { mem },
                         Operator::Return => Operator::Return,
@@ -209,8 +248,42 @@ impl WasmModule {
                         Operator::I32TruncF64U => Operator::I32TruncF64U,
                         Operator::F64PromoteF32 => Operator::F64PromoteF32,
                         Operator::F32DemoteF64 => Operator::F32DemoteF64,
+                        // Phase 1: select + ビットカウント系命令
+                        Operator::Select => Operator::Select,
+                        Operator::I32Clz => Operator::I32Clz,
+                        Operator::I32Ctz => Operator::I32Ctz,
+                        Operator::I32Popcnt => Operator::I32Popcnt,
+                        Operator::I64Clz => Operator::I64Clz,
+                        Operator::I64Ctz => Operator::I64Ctz,
+                        Operator::I64Popcnt => Operator::I64Popcnt,
+                        // Phase 2: 浮動小数点高度演算
+                        Operator::F32Abs => Operator::F32Abs,
+                        Operator::F32Neg => Operator::F32Neg,
+                        Operator::F32Sqrt => Operator::F32Sqrt,
+                        Operator::F32Ceil => Operator::F32Ceil,
+                        Operator::F32Floor => Operator::F32Floor,
+                        Operator::F32Trunc => Operator::F32Trunc,
+                        Operator::F32Nearest => Operator::F32Nearest,
+                        Operator::F32Min => Operator::F32Min,
+                        Operator::F32Max => Operator::F32Max,
+                        Operator::F32Copysign => Operator::F32Copysign,
+                        Operator::F64Abs => Operator::F64Abs,
+                        Operator::F64Neg => Operator::F64Neg,
+                        Operator::F64Sqrt => Operator::F64Sqrt,
+                        Operator::F64Ceil => Operator::F64Ceil,
+                        Operator::F64Floor => Operator::F64Floor,
+                        Operator::F64Trunc => Operator::F64Trunc,
+                        Operator::F64Nearest => Operator::F64Nearest,
+                        Operator::F64Min => Operator::F64Min,
+                        Operator::F64Max => Operator::F64Max,
+                        Operator::F64Copysign => Operator::F64Copysign,
+                        // Phase 3: バルクメモリ操作
+                        Operator::MemoryCopy { src_mem, dst_mem } => {
+                            Operator::MemoryCopy { src_mem, dst_mem }
+                        }
+                        Operator::MemoryFill { mem } => Operator::MemoryFill { mem },
                         _ => {
-                            eprintln!("Unsupported operator: {:?}", op);
+                            eprintln!("Unsupported operator: {op:?}");
                             continue;
                         }
                     };
@@ -233,6 +306,7 @@ impl WasmModule {
             start_func_idx,
             memories,
             has_putchar_import,
+            globals,
         })
     }
 }

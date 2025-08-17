@@ -77,7 +77,7 @@ fn compile_command(wasm_file: &str, output_file: &str) -> Result<()> {
     compiler.compile_module(&wasm_module)?;
     compiler.write_object_file(output_file)?;
 
-    println!("Compiled to: {}", output_file);
+    println!("Compiled to: {output_file}");
     Ok(())
 }
 
@@ -93,7 +93,7 @@ fn ir_command(wasm_file: &str, output_file: Option<&str>) -> Result<()> {
     match output_file {
         Some(file) => {
             compiler.write_ir_to_file(file)?;
-            println!("LLVM IR written to: {}", file);
+            println!("LLVM IR written to: {file}");
         }
         None => {
             compiler.print_ir_to_stdout();

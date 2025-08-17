@@ -92,74 +92,38 @@ fn test_jit(wat_path: &str, expected_output_path: &str) {
     fs::remove_file(&wasm_file).ok();
 }
 
+fn test_path(test_case: &str) -> (String, String, String) {
+    let wat_path = format!("tests/wat/{test_case}.wat");
+    let ir_path = format!("tests/ir/{test_case}.ll");
+    let output_path = format!("tests/output/{test_case}.txt");
+    (wat_path, ir_path, output_path)
+}
+
 #[test]
 fn test_e2e() {
     let test_cases = [
-        (
-            "tests/wat/basic_arithmetic.wat",
-            "tests/ir/basic_arithmetic.ll",
-            "tests/output/basic_arithmetic.txt",
-        ),
-        (
-            "tests/wat/memory_operations.wat",
-            "tests/ir/memory_operations.ll",
-            "tests/output/memory_operations.txt",
-        ),
-        (
-            "tests/wat/local_variables.wat",
-            "tests/ir/local_variables.ll",
-            "tests/output/local_variables.txt",
-        ),
-        (
-            "tests/wat/control_flow.wat",
-            "tests/ir/control_flow.ll",
-            "tests/output/control_flow.txt",
-        ),
-        (
-            "tests/wat/for_loop.wat",
-            "tests/ir/for_loop.ll",
-            "tests/output/for_loop.txt",
-        ),
-        (
-            "tests/wat/i32_extended.wat",
-            "tests/ir/i32_extended.ll",
-            "tests/output/i32_extended.txt",
-        ),
-        (
-            "tests/wat/i32_bitwise.wat",
-            "tests/ir/i32_bitwise.ll",
-            "tests/output/i32_bitwise.txt",
-        ),
-        (
-            "tests/wat/i64_arithmetic.wat",
-            "tests/ir/i64_arithmetic.ll",
-            "tests/output/i64_arithmetic.txt",
-        ),
-        (
-            "tests/wat/i64_comparisons.wat",
-            "tests/ir/i64_comparisons.ll",
-            "tests/output/i64_comparisons.txt",
-        ),
-        (
-            "tests/wat/i64_bitwise.wat",
-            "tests/ir/i64_bitwise.ll",
-            "tests/output/i64_bitwise.txt",
-        ),
-        (
-            "tests/wat/complex_operations.wat",
-            "tests/ir/complex_operations.ll",
-            "tests/output/complex_operations.txt",
-        ),
-        (
-            "tests/wat/type_conversions.wat",
-            "tests/ir/type_conversions.ll",
-            "tests/output/type_conversions.txt",
-        ),
+        "basic_arithmetic",
+        "memory_operations",
+        "local_variables",
+        "control_flow",
+        "for_loop",
+        "i32_extended",
+        "i32_bitwise",
+        "i64_arithmetic",
+        "i64_comparisons",
+        "i64_bitwise",
+        "complex_operations",
+        "type_conversions",
+        "memory_operations_extended",
+        "select_bitcount",
+        "float_advanced",
+        "bulk_memory",
+        // "reference_types", // TODO: Implement RefNull/RefIsNull in wasm_parser
     ];
 
-    for (wat_path, ir_path, output_path) in test_cases.iter() {
-        test_ir(wat_path, ir_path);
-        test_compile(wat_path);
-        test_jit(wat_path, output_path);
+    for (wat_path, ir_path, output_path) in test_cases.into_iter().map(test_path) {
+        test_ir(&wat_path, &ir_path);
+        test_compile(&wat_path);
+        test_jit(&wat_path, &output_path);
     }
 }

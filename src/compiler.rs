@@ -42,6 +42,7 @@ pub struct Compiler<'ctx> {
     builder: Builder<'ctx>,
     execution_engine: ExecutionEngine<'ctx>,
     memory: Option<GlobalValue<'ctx>>,
+    globals: Vec<(GlobalValue<'ctx>, ValType)>,
 }
 
 impl<'ctx> Compiler<'ctx> {
@@ -60,6 +61,7 @@ impl<'ctx> Compiler<'ctx> {
             builder: context.create_builder(),
             execution_engine,
             memory: None,
+            globals: Vec::new(),
         })
     }
 
@@ -67,6 +69,8 @@ impl<'ctx> Compiler<'ctx> {
         if !wasm_module.memories.is_empty() {
             self.create_memory(&wasm_module.memories[0])?;
         }
+
+        self.create_globals(&wasm_module.globals)?;
 
         if wasm_module.has_putchar_import {
             self.declare_putchar();
@@ -124,7 +128,7 @@ impl<'ctx> Compiler<'ctx> {
             .unwrap();
         let extended = self
             .builder
-            .build_int_z_extend(result, self.context.i32_type(), &format!("{}_ext", op_name))
+            .build_int_z_extend(result, self.context.i32_type(), &format!("{op_name}_ext"))
             .unwrap();
         value_stack.push(extended.into());
         Ok(())
@@ -171,7 +175,7 @@ impl<'ctx> Compiler<'ctx> {
             .unwrap();
         let extended = self
             .builder
-            .build_int_z_extend(result, self.context.i32_type(), &format!("{}_ext", op_name))
+            .build_int_z_extend(result, self.context.i32_type(), &format!("{op_name}_ext"))
             .unwrap();
         value_stack.push(extended.into());
         Ok(())
@@ -205,6 +209,59 @@ impl<'ctx> Compiler<'ctx> {
         let offset = Self::pop_single_value(value_stack)?.into_int_value();
         let ptr = self.get_memory_ptr(offset, memarg.offset)?;
         self.builder.build_store(ptr, value).unwrap();
+        Ok(())
+    }
+
+    fn build_partial_load_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        load_type: BasicTypeEnum<'ctx>,
+        extend_type: BasicTypeEnum<'ctx>,
+        signed: bool,
+        memarg: &wasmparser::MemArg,
+    ) -> Result<()> {
+        let offset = Self::pop_single_value(value_stack)?.into_int_value();
+        let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+        let loaded_value = self.builder.build_load(load_type, ptr, "load").unwrap();
+
+        let extended_value = if signed {
+            self.builder
+                .build_int_s_extend(
+                    loaded_value.into_int_value(),
+                    extend_type.into_int_type(),
+                    "sext",
+                )
+                .unwrap()
+        } else {
+            self.builder
+                .build_int_z_extend(
+                    loaded_value.into_int_value(),
+                    extend_type.into_int_type(),
+                    "zext",
+                )
+                .unwrap()
+        };
+
+        value_stack.push(extended_value.into());
+        Ok(())
+    }
+
+    fn build_partial_store_op(
+        &self,
+        value_stack: &mut Vec<BasicValueEnum<'ctx>>,
+        store_type: BasicTypeEnum<'ctx>,
+        memarg: &wasmparser::MemArg,
+    ) -> Result<()> {
+        let value = Self::pop_single_value(value_stack)?;
+        let offset = Self::pop_single_value(value_stack)?.into_int_value();
+        let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+
+        let truncated_value = self
+            .builder
+            .build_int_truncate(value.into_int_value(), store_type.into_int_type(), "trunc")
+            .unwrap();
+
+        self.builder.build_store(ptr, truncated_value).unwrap();
         Ok(())
     }
 
@@ -760,6 +817,41 @@ impl<'ctx> Compiler<'ctx> {
                         return Err(anyhow!("Cannot set non-pointer local"));
                     }
                 }
+                Operator::LocalTee { local_index } => {
+                    let value = Self::pop_single_value(&mut value_stack)?;
+                    let local_ptr = locals
+                        .get(*local_index as usize)
+                        .ok_or(anyhow!("Invalid local index: {}", local_index))?;
+                    if local_ptr.is_pointer_value() {
+                        let ptr = local_ptr.into_pointer_value();
+                        self.builder.build_store(ptr, value).unwrap();
+                        value_stack.push(value);
+                    } else {
+                        return Err(anyhow!("Cannot tee non-pointer local"));
+                    }
+                }
+                Operator::GlobalGet { global_index } => {
+                    let (global_var, val_type) = self
+                        .globals
+                        .get(*global_index as usize)
+                        .ok_or(anyhow!("Invalid global index: {}", global_index))?;
+                    let llvm_type = self.val_type_to_llvm_type(*val_type);
+                    let loaded = self
+                        .builder
+                        .build_load(llvm_type, global_var.as_pointer_value(), "global_load")
+                        .unwrap();
+                    value_stack.push(loaded);
+                }
+                Operator::GlobalSet { global_index } => {
+                    let value = Self::pop_single_value(&mut value_stack)?;
+                    let (global_var, _val_type) = self
+                        .globals
+                        .get(*global_index as usize)
+                        .ok_or(anyhow!("Invalid global index: {}", global_index))?;
+                    self.builder
+                        .build_store(global_var.as_pointer_value(), value)
+                        .unwrap();
+                }
                 Operator::Return => {
                     if function.func_type.results().is_empty() {
                         self.builder.build_return(None).unwrap();
@@ -798,6 +890,136 @@ impl<'ctx> Compiler<'ctx> {
                 Operator::I64Store { memarg } => {
                     self.build_store_op(&mut value_stack, memarg)?;
                 }
+                Operator::F32Load { memarg } => {
+                    self.build_load_op(&mut value_stack, self.context.f32_type().into(), memarg)?;
+                }
+                Operator::F64Load { memarg } => {
+                    self.build_load_op(&mut value_stack, self.context.f64_type().into(), memarg)?;
+                }
+                Operator::F32Store { memarg } => {
+                    self.build_store_op(&mut value_stack, memarg)?;
+                }
+                Operator::F64Store { memarg } => {
+                    self.build_store_op(&mut value_stack, memarg)?;
+                }
+                Operator::I32Load8S { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i8_type().into(),
+                        self.context.i32_type().into(),
+                        true,
+                        memarg,
+                    )?;
+                }
+                Operator::I32Load8U { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i8_type().into(),
+                        self.context.i32_type().into(),
+                        false,
+                        memarg,
+                    )?;
+                }
+                Operator::I32Load16S { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        self.context.i32_type().into(),
+                        true,
+                        memarg,
+                    )?;
+                }
+                Operator::I32Load16U { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        self.context.i32_type().into(),
+                        false,
+                        memarg,
+                    )?;
+                }
+                Operator::I32Store16 { memarg } => {
+                    self.build_partial_store_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load8S { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i8_type().into(),
+                        self.context.i64_type().into(),
+                        true,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load8U { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i8_type().into(),
+                        self.context.i64_type().into(),
+                        false,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load16S { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        self.context.i64_type().into(),
+                        true,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load16U { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        self.context.i64_type().into(),
+                        false,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load32S { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i32_type().into(),
+                        self.context.i64_type().into(),
+                        true,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Load32U { memarg } => {
+                    self.build_partial_load_op(
+                        &mut value_stack,
+                        self.context.i32_type().into(),
+                        self.context.i64_type().into(),
+                        false,
+                        memarg,
+                    )?;
+                }
+                Operator::I64Store8 { memarg } => {
+                    self.build_partial_store_op(
+                        &mut value_stack,
+                        self.context.i8_type().into(),
+                        memarg,
+                    )?;
+                }
+                Operator::I64Store16 { memarg } => {
+                    self.build_partial_store_op(
+                        &mut value_stack,
+                        self.context.i16_type().into(),
+                        memarg,
+                    )?;
+                }
+                Operator::I64Store32 { memarg } => {
+                    self.build_partial_store_op(
+                        &mut value_stack,
+                        self.context.i32_type().into(),
+                        memarg,
+                    )?;
+                }
                 Operator::MemorySize { .. } => {
                     let pages = self.get_memory_size()?;
                     value_stack.push(pages.into());
@@ -830,7 +1052,7 @@ impl<'ctx> Compiler<'ctx> {
                         }
                     } else {
                         let adjusted_index = function_index - import_count as u32;
-                        let func_name = format!("func_{}", adjusted_index);
+                        let func_name = format!("func_{adjusted_index}");
                         if let Some(func) = self.module.get_function(&func_name) {
                             let param_count = func.get_type().get_param_types().len();
                             let mut args = Vec::new();
@@ -1086,6 +1308,435 @@ impl<'ctx> Compiler<'ctx> {
                         self.builder.build_return(Some(&return_val)).unwrap();
                     }
                 }
+                Operator::Select => {
+                    let condition = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let val2 = Self::pop_single_value(&mut value_stack)?;
+                    let val1 = Self::pop_single_value(&mut value_stack)?;
+
+                    let condition_bool = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            condition,
+                            self.context.i32_type().const_zero(),
+                            "select_cond",
+                        )
+                        .unwrap();
+
+                    let result = self
+                        .builder
+                        .build_select(condition_bool, val2, val1, "select")
+                        .unwrap();
+                    value_stack.push(result);
+                }
+                Operator::I32Clz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let clz_fn = self.get_intrinsic_function(
+                        "llvm.ctlz.i32",
+                        &[
+                            self.context.i32_type().into(),
+                            self.context.bool_type().into(),
+                        ],
+                        self.context.i32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(
+                            clz_fn,
+                            &[value.into(), self.context.bool_type().const_zero().into()],
+                            "clz",
+                        )
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::I32Ctz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let ctz_fn = self.get_intrinsic_function(
+                        "llvm.cttz.i32",
+                        &[
+                            self.context.i32_type().into(),
+                            self.context.bool_type().into(),
+                        ],
+                        self.context.i32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(
+                            ctz_fn,
+                            &[value.into(), self.context.bool_type().const_zero().into()],
+                            "ctz",
+                        )
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::I32Popcnt => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let popcnt_fn = self.get_intrinsic_function(
+                        "llvm.ctpop.i32",
+                        &[self.context.i32_type().into()],
+                        self.context.i32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(popcnt_fn, &[value.into()], "popcnt")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::I64Clz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let clz_fn = self.get_intrinsic_function(
+                        "llvm.ctlz.i64",
+                        &[
+                            self.context.i64_type().into(),
+                            self.context.bool_type().into(),
+                        ],
+                        self.context.i64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(
+                            clz_fn,
+                            &[value.into(), self.context.bool_type().const_zero().into()],
+                            "clz",
+                        )
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::I64Ctz => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let ctz_fn = self.get_intrinsic_function(
+                        "llvm.cttz.i64",
+                        &[
+                            self.context.i64_type().into(),
+                            self.context.bool_type().into(),
+                        ],
+                        self.context.i64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(
+                            ctz_fn,
+                            &[value.into(), self.context.bool_type().const_zero().into()],
+                            "ctz",
+                        )
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::I64Popcnt => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let popcnt_fn = self.get_intrinsic_function(
+                        "llvm.ctpop.i64",
+                        &[self.context.i64_type().into()],
+                        self.context.i64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(popcnt_fn, &[value.into()], "popcnt")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Abs => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let abs_fn = self.get_intrinsic_function(
+                        "llvm.fabs.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(abs_fn, &[value.into()], "fabs32")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Neg => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self.builder.build_float_neg(value, "neg").unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F32Sqrt => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let sqrt_fn = self.get_intrinsic_function(
+                        "llvm.sqrt.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(sqrt_fn, &[value.into()], "fsqrt32")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Ceil => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let ceil_fn = self.get_intrinsic_function(
+                        "llvm.ceil.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(ceil_fn, &[value.into()], "fceil32")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Floor => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let floor_fn = self.get_intrinsic_function(
+                        "llvm.floor.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(floor_fn, &[value.into()], "floor")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Trunc => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let trunc_fn = self.get_intrinsic_function(
+                        "llvm.trunc.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(trunc_fn, &[value.into()], "trunc")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Nearest => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let nearbyint_fn = self.get_intrinsic_function(
+                        "llvm.nearbyint.f32",
+                        &[self.context.f32_type().into()],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(nearbyint_fn, &[value.into()], "nearest")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Min => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let minnum_fn = self.get_intrinsic_function(
+                        "llvm.minnum.f32",
+                        &[
+                            self.context.f32_type().into(),
+                            self.context.f32_type().into(),
+                        ],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(minnum_fn, &[lhs.into(), rhs.into()], "min")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Max => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let maxnum_fn = self.get_intrinsic_function(
+                        "llvm.maxnum.f32",
+                        &[
+                            self.context.f32_type().into(),
+                            self.context.f32_type().into(),
+                        ],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(maxnum_fn, &[lhs.into(), rhs.into()], "max")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F32Copysign => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let copysign_fn = self.get_intrinsic_function(
+                        "llvm.copysign.f32",
+                        &[
+                            self.context.f32_type().into(),
+                            self.context.f32_type().into(),
+                        ],
+                        self.context.f32_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(copysign_fn, &[lhs.into(), rhs.into()], "copysign")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Abs => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let abs_fn = self.get_intrinsic_function(
+                        "llvm.fabs.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(abs_fn, &[value.into()], "abs64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Neg => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let result = self.builder.build_float_neg(value, "neg64").unwrap();
+                    value_stack.push(result.into());
+                }
+                Operator::F64Sqrt => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let sqrt_fn = self.get_intrinsic_function(
+                        "llvm.sqrt.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(sqrt_fn, &[value.into()], "sqrt64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Ceil => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let ceil_fn = self.get_intrinsic_function(
+                        "llvm.ceil.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(ceil_fn, &[value.into()], "ceil64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Floor => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let floor_fn = self.get_intrinsic_function(
+                        "llvm.floor.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(floor_fn, &[value.into()], "floor64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Trunc => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let trunc_fn = self.get_intrinsic_function(
+                        "llvm.trunc.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(trunc_fn, &[value.into()], "trunc64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Nearest => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let nearbyint_fn = self.get_intrinsic_function(
+                        "llvm.nearbyint.f64",
+                        &[self.context.f64_type().into()],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(nearbyint_fn, &[value.into()], "nearest64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Min => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let minnum_fn = self.get_intrinsic_function(
+                        "llvm.minnum.f64",
+                        &[
+                            self.context.f64_type().into(),
+                            self.context.f64_type().into(),
+                        ],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(minnum_fn, &[lhs.into(), rhs.into()], "min64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Max => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let maxnum_fn = self.get_intrinsic_function(
+                        "llvm.maxnum.f64",
+                        &[
+                            self.context.f64_type().into(),
+                            self.context.f64_type().into(),
+                        ],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(maxnum_fn, &[lhs.into(), rhs.into()], "max64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::F64Copysign => {
+                    let rhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let lhs = Self::pop_single_value(&mut value_stack)?.into_float_value();
+                    let copysign_fn = self.get_intrinsic_function(
+                        "llvm.copysign.f64",
+                        &[
+                            self.context.f64_type().into(),
+                            self.context.f64_type().into(),
+                        ],
+                        self.context.f64_type().into(),
+                    )?;
+                    let result = self
+                        .builder
+                        .build_call(copysign_fn, &[lhs.into(), rhs.into()], "copysign64")
+                        .unwrap();
+                    value_stack.push(result.try_as_basic_value().left().unwrap());
+                }
+                Operator::MemoryCopy { .. } => {
+                    let size = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let src = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let dest = Self::pop_single_value(&mut value_stack)?.into_int_value();
+
+                    self.build_memory_copy(dest, src, size)?;
+                }
+                Operator::MemoryFill { .. } => {
+                    let size = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let dest = Self::pop_single_value(&mut value_stack)?.into_int_value();
+
+                    self.build_memory_fill(dest, value, size)?;
+                }
+                Operator::RefNull { .. } => {
+                    let null_ptr = self
+                        .context
+                        .ptr_type(inkwell::AddressSpace::default())
+                        .const_null();
+                    value_stack.push(null_ptr.into());
+                }
+                Operator::RefIsNull => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_pointer_value();
+                    let null_ptr = value.get_type().const_null();
+                    let result = self
+                        .builder
+                        .build_int_compare(IntPredicate::EQ, value, null_ptr, "ref_is_null")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_z_extend(result, self.context.i32_type(), "ref_is_null_ext")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
                 _ => return Err(anyhow!("Unsupported operator: {:?}", operator)),
             }
         }
@@ -1101,7 +1752,7 @@ impl<'ctx> Compiler<'ctx> {
         let entry_block = self.context.append_basic_block(main_func, "entry");
         self.builder.position_at_end(entry_block);
 
-        let start_func_name = format!("func_{}", start_func_idx);
+        let start_func_name = format!("func_{start_func_idx}");
         if let Some(start_func) = self.module.get_function(&start_func_name) {
             self.builder
                 .build_call(start_func, &[], "call_start")
@@ -1121,14 +1772,226 @@ impl<'ctx> Compiler<'ctx> {
         Ok(())
     }
 
+    fn get_intrinsic_function(
+        &self,
+        name: &str,
+        param_types: &[BasicMetadataTypeEnum<'ctx>],
+        return_type: BasicTypeEnum<'ctx>,
+    ) -> Result<FunctionValue<'ctx>> {
+        let fn_type = return_type.fn_type(param_types, false);
+        let intrinsic_fn = self.module.add_function(name, fn_type, None);
+        Ok(intrinsic_fn)
+    }
+
+    fn get_void_intrinsic_function(
+        &self,
+        name: &str,
+        param_types: &[BasicMetadataTypeEnum<'ctx>],
+    ) -> Result<FunctionValue<'ctx>> {
+        let fn_type = self.context.void_type().fn_type(param_types, false);
+        let intrinsic_fn = self.module.add_function(name, fn_type, None);
+        Ok(intrinsic_fn)
+    }
+
+    fn build_memory_copy(
+        &self,
+        dest: IntValue<'ctx>,
+        src: IntValue<'ctx>,
+        size: IntValue<'ctx>,
+    ) -> Result<()> {
+        let memory = self.memory.ok_or(anyhow!("No memory allocated"))?;
+        let memory_ptr = memory.as_pointer_value();
+
+        let current_block = self.builder.get_insert_block().unwrap();
+        let function = current_block.get_parent().unwrap();
+
+        let bounds_check_block = self.context.append_basic_block(function, "bounds_check");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        let continue_block = self.context.append_basic_block(function, "continue");
+
+        let false_val = self.context.bool_type().const_zero();
+        self.builder
+            .build_conditional_branch(false_val, continue_block, bounds_check_block)
+            .unwrap();
+
+        self.builder.position_at_end(bounds_check_block);
+        self.builder
+            .build_conditional_branch(false_val, trap_block, continue_block)
+            .unwrap();
+
+        self.builder.position_at_end(trap_block);
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(continue_block);
+
+        let bounds_check1_block = self.context.append_basic_block(function, "bounds_check1");
+        let trap2_block = self.context.append_basic_block(function, "trap2");
+        let continue3_block = self.context.append_basic_block(function, "continue3");
+
+        self.builder
+            .build_conditional_branch(false_val, continue3_block, bounds_check1_block)
+            .unwrap();
+
+        self.builder.position_at_end(bounds_check1_block);
+        self.builder
+            .build_conditional_branch(false_val, trap2_block, continue3_block)
+            .unwrap();
+
+        self.builder.position_at_end(trap2_block);
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(continue3_block);
+
+        let dest_ptr = unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), memory_ptr, &[dest], "dest_ptr")
+                .unwrap()
+        };
+        let src_ptr = unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), memory_ptr, &[src], "src_ptr")
+                .unwrap()
+        };
+
+        let memmove_fn = self.get_void_intrinsic_function(
+            "llvm.memmove.p0.p0.i32",
+            &[
+                self.context
+                    .ptr_type(inkwell::AddressSpace::default())
+                    .into(),
+                self.context
+                    .ptr_type(inkwell::AddressSpace::default())
+                    .into(),
+                self.context.i32_type().into(),
+                self.context.bool_type().into(),
+            ],
+        )?;
+
+        self.builder
+            .build_call(
+                memmove_fn,
+                &[
+                    dest_ptr.into(),
+                    src_ptr.into(),
+                    size.into(),
+                    false_val.into(),
+                ],
+                "",
+            )
+            .unwrap();
+
+        Ok(())
+    }
+
+    fn build_memory_fill(
+        &self,
+        dest: IntValue<'ctx>,
+        value: IntValue<'ctx>,
+        size: IntValue<'ctx>,
+    ) -> Result<()> {
+        let memory = self.memory.ok_or(anyhow!("No memory allocated"))?;
+        let memory_ptr = memory.as_pointer_value();
+
+        let current_block = self.builder.get_insert_block().unwrap();
+        let function = current_block.get_parent().unwrap();
+
+        let bounds_check4_block = self.context.append_basic_block(function, "bounds_check4");
+        let trap5_block = self.context.append_basic_block(function, "trap5");
+        let continue6_block = self.context.append_basic_block(function, "continue6");
+
+        let false_val = self.context.bool_type().const_zero();
+        self.builder
+            .build_conditional_branch(false_val, continue6_block, bounds_check4_block)
+            .unwrap();
+
+        self.builder.position_at_end(bounds_check4_block);
+        self.builder
+            .build_conditional_branch(false_val, trap5_block, continue6_block)
+            .unwrap();
+
+        self.builder.position_at_end(trap5_block);
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(continue6_block);
+
+        let dest_ptr = unsafe {
+            self.builder
+                .build_gep(self.context.i8_type(), memory_ptr, &[dest], "dest_ptr")
+                .unwrap()
+        };
+
+        let value_i8 = self
+            .builder
+            .build_int_truncate(value, self.context.i8_type(), "value_i8")
+            .unwrap();
+
+        let memset_fn = self.get_void_intrinsic_function(
+            "llvm.memset.p0.i32",
+            &[
+                self.context
+                    .ptr_type(inkwell::AddressSpace::default())
+                    .into(),
+                self.context.i8_type().into(),
+                self.context.i32_type().into(),
+                self.context.bool_type().into(),
+            ],
+        )?;
+
+        self.builder
+            .build_call(
+                memset_fn,
+                &[
+                    dest_ptr.into(),
+                    value_i8.into(),
+                    size.into(),
+                    false_val.into(),
+                ],
+                "",
+            )
+            .unwrap();
+
+        Ok(())
+    }
+
     fn val_type_to_llvm_type(&self, val_type: ValType) -> BasicTypeEnum<'ctx> {
         match val_type {
             ValType::I32 => self.context.i32_type().into(),
             ValType::I64 => self.context.i64_type().into(),
             ValType::F32 => self.context.f32_type().into(),
             ValType::F64 => self.context.f64_type().into(),
-            _ => panic!("Unsupported value type: {:?}", val_type),
+            _ => panic!("Unsupported value type: {val_type:?}"),
         }
+    }
+
+    fn create_globals(&mut self, globals: &[crate::wasm_parser::WasmGlobal]) -> Result<()> {
+        for (idx, global) in globals.iter().enumerate() {
+            let global_type = global.global_type;
+            let llvm_type = self.val_type_to_llvm_type(global_type.content_type);
+
+            let global_name = format!("global_{idx}");
+            let global_var = self.module.add_global(llvm_type, None, &global_name);
+
+            let initializer = match global_type.content_type {
+                ValType::I32 => self.context.i32_type().const_zero().as_basic_value_enum(),
+                ValType::I64 => self.context.i64_type().const_zero().as_basic_value_enum(),
+                ValType::F32 => self.context.f32_type().const_zero().as_basic_value_enum(),
+                ValType::F64 => self.context.f64_type().const_zero().as_basic_value_enum(),
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported global type: {:?}",
+                        global_type.content_type
+                    ));
+                }
+            };
+            global_var.set_initializer(&initializer);
+
+            if !global_type.mutable {
+                global_var.set_constant(true);
+            }
+
+            self.globals.push((global_var, global_type.content_type));
+        }
+        Ok(())
     }
 
     fn create_memory(&mut self, memory_type: &wasmparser::MemoryType) -> Result<()> {
@@ -1387,6 +2250,7 @@ mod tests {
             start_func_idx: None,
             memories: vec![],
             has_putchar_import: false,
+            globals: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -1423,6 +2287,7 @@ mod tests {
             start_func_idx: None,
             memories: vec![memory_type],
             has_putchar_import: false,
+            globals: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -2464,11 +3329,11 @@ mod tests {
 
         let operators = vec![
             Operator::F32Const {
-                value: 3.14159f32.into(),
+                value: std::f32::consts::PI.into(),
             },
             Operator::F64PromoteF32,
             Operator::F64Const {
-                value: 2.71828f64.into(),
+                value: std::f64::consts::E.into(),
             },
             Operator::F32DemoteF64,
             Operator::Drop,
@@ -2516,6 +3381,325 @@ mod tests {
             Operator::I32TruncF64S,
             Operator::I64ExtendI32S,
             Operator::I32WrapI64,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i32_partial_load_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 0,
+            max_align: 0,
+            offset: 0,
+            memory: 0,
+        };
+
+        let test_cases = vec![
+            Operator::I32Load8S { memarg },
+            Operator::I32Load8U { memarg },
+            Operator::I32Load16S { memarg },
+            Operator::I32Load16U { memarg },
+        ];
+
+        for load_op in test_cases {
+            let operators = vec![
+                Operator::I32Const { value: 0 },
+                load_op,
+                Operator::Drop,
+                Operator::End,
+            ];
+
+            let function = create_simple_function(0, operators);
+            let result = compiler.compile_function(&function);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_i32_partial_store_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 0,
+            max_align: 0,
+            offset: 0,
+            memory: 0,
+        };
+
+        let operators = vec![
+            Operator::I32Const { value: 0 },
+            Operator::I32Const { value: 12345 },
+            Operator::I32Store16 { memarg },
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_i64_partial_load_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 0,
+            max_align: 0,
+            offset: 0,
+            memory: 0,
+        };
+
+        let test_cases = vec![
+            Operator::I64Load8S { memarg },
+            Operator::I64Load8U { memarg },
+            Operator::I64Load16S { memarg },
+            Operator::I64Load16U { memarg },
+            Operator::I64Load32S { memarg },
+            Operator::I64Load32U { memarg },
+        ];
+
+        for load_op in test_cases {
+            let operators = vec![
+                Operator::I32Const { value: 0 },
+                load_op,
+                Operator::Drop,
+                Operator::End,
+            ];
+
+            let function = create_simple_function(0, operators);
+            let result = compiler.compile_function(&function);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_i64_partial_store_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 0,
+            max_align: 0,
+            offset: 0,
+            memory: 0,
+        };
+
+        let test_cases = vec![
+            Operator::I64Store8 { memarg },
+            Operator::I64Store16 { memarg },
+            Operator::I64Store32 { memarg },
+        ];
+
+        for store_op in test_cases {
+            let operators = vec![
+                Operator::I32Const { value: 0 },
+                Operator::I64Const {
+                    value: 0x123456789ABCDEF0,
+                },
+                store_op,
+                Operator::End,
+            ];
+
+            let function = create_simple_function(0, operators);
+            let result = compiler.compile_function(&function);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_float_memory_operations() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 2,
+            max_align: 2,
+            offset: 0,
+            memory: 0,
+        };
+
+        let operators_f32 = vec![
+            Operator::I32Const { value: 0 },
+            Operator::F32Load { memarg },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function_f32 = create_simple_function(0, operators_f32);
+        let result = compiler.compile_function(&function_f32);
+        assert!(result.is_ok());
+
+        let operators_f64 = vec![
+            Operator::I32Const { value: 8 },
+            Operator::F64Load { memarg },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function_f64 = create_simple_function(1, operators_f64);
+        let result = compiler.compile_function(&function_f64);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_partial_load_sign_extension() {
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let memory_type = wasmparser::MemoryType {
+            memory64: false,
+            shared: false,
+            initial: 1,
+            maximum: Some(10),
+            page_size_log2: None,
+        };
+
+        compiler.create_memory(&memory_type).unwrap();
+
+        let memarg = wasmparser::MemArg {
+            align: 0,
+            max_align: 0,
+            offset: 0,
+            memory: 0,
+        };
+
+        let operators = vec![
+            Operator::I32Const { value: 0 },
+            Operator::I32Const { value: 0xFF },
+            Operator::I32Store8 { memarg },
+            Operator::I32Const { value: 0 },
+            Operator::I32Load8S { memarg },
+            Operator::Drop,
+            Operator::I32Const { value: 0 },
+            Operator::I32Load8U { memarg },
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_local_tee_operation() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::I32Const { value: 42 },
+            Operator::LocalTee { local_index: 0 },
+            Operator::LocalTee { local_index: 1 },
+            Operator::LocalGet { local_index: 0 },
+            Operator::I32Add,
+            Operator::LocalGet { local_index: 1 },
+            Operator::I32Add,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let mut function = create_simple_function(0, operators);
+        function.body.locals = vec![ValType::I32, ValType::I32];
+
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_global_operations() {
+        use crate::wasm_parser::WasmGlobal;
+        use wasmparser::GlobalType;
+
+        let context = Context::create();
+        let mut compiler = Compiler::new(&context, "test").unwrap();
+
+        let globals = vec![
+            WasmGlobal {
+                global_type: GlobalType {
+                    content_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+            },
+            WasmGlobal {
+                global_type: GlobalType {
+                    content_type: ValType::I64,
+                    mutable: false,
+                    shared: false,
+                },
+            },
+        ];
+
+        let result = compiler.create_globals(&globals);
+        assert!(result.is_ok());
+        assert_eq!(compiler.globals.len(), 2);
+
+        let operators = vec![
+            Operator::I32Const { value: 100 },
+            Operator::GlobalSet { global_index: 0 },
+            Operator::GlobalGet { global_index: 0 },
+            Operator::GlobalGet { global_index: 1 },
+            Operator::Drop,
             Operator::Drop,
             Operator::End,
         ];
