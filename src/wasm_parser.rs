@@ -5,6 +5,7 @@ pub struct WasmModule {
     pub functions: Vec<Function>,
     pub start_func_idx: Option<u32>,
     pub memories: Vec<MemoryType>,
+    pub has_putchar_import: bool,
 }
 
 pub struct Function {
@@ -27,6 +28,7 @@ impl WasmModule {
         let mut func_bodies = Vec::new();
         let mut import_count = 0;
         let mut memories = Vec::new();
+        let mut has_putchar_import = false;
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
             match payload? {
@@ -46,6 +48,9 @@ impl WasmModule {
                         let import = import?;
                         if matches!(import.ty, TypeRef::Func(_)) {
                             import_count += 1;
+                            if import.name == "putchar" {
+                                has_putchar_import = true;
+                            }
                         }
                     }
                 }
@@ -102,9 +107,12 @@ impl WasmModule {
                         Operator::I32Sub => Operator::I32Sub,
                         Operator::I32Mul => Operator::I32Mul,
                         Operator::I32DivS => Operator::I32DivS,
+                        Operator::I32RemS => Operator::I32RemS,
                         Operator::LocalGet { local_index } => Operator::LocalGet { local_index },
+                        Operator::LocalSet { local_index } => Operator::LocalSet { local_index },
                         Operator::I32Load { memarg } => Operator::I32Load { memarg },
                         Operator::I32Store { memarg } => Operator::I32Store { memarg },
+                        Operator::I32Store8 { memarg } => Operator::I32Store8 { memarg },
                         Operator::I64Load { memarg } => Operator::I64Load { memarg },
                         Operator::I64Store { memarg } => Operator::I64Store { memarg },
                         Operator::MemorySize { mem, .. } => Operator::MemorySize { mem },
@@ -112,6 +120,7 @@ impl WasmModule {
                         Operator::Return => Operator::Return,
                         Operator::End => Operator::End,
                         Operator::Drop => Operator::Drop,
+                        Operator::Call { function_index } => Operator::Call { function_index },
                         _ => continue,
                     };
                     operators.push(owned_op);
@@ -132,6 +141,7 @@ impl WasmModule {
             functions,
             start_func_idx,
             memories,
+            has_putchar_import,
         })
     }
 }
@@ -151,6 +161,7 @@ mod tests {
         assert!(module.functions.is_empty());
         assert!(module.start_func_idx.is_none());
         assert!(module.memories.is_empty());
+        assert!(!module.has_putchar_import);
     }
 
     #[test]

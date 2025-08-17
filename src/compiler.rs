@@ -11,6 +11,14 @@ use wasmparser::{Operator, ValType};
 
 use crate::wasm_parser::{Function, WasmModule};
 
+extern "C" fn putchar_wrapper(c: i32) -> i32 {
+    let byte = (c & 0xFF) as u8;
+    print!("{}", byte as char);
+    use std::io::{self, Write};
+    io::stdout().flush().unwrap();
+    c
+}
+
 pub struct Compiler<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -41,6 +49,10 @@ impl<'ctx> Compiler<'ctx> {
     pub fn compile_module(&mut self, wasm_module: &WasmModule) -> Result<()> {
         if !wasm_module.memories.is_empty() {
             self.create_memory(&wasm_module.memories[0])?;
+        }
+
+        if wasm_module.has_putchar_import {
+            self.declare_putchar();
         }
 
         for function in &wasm_module.functions {
@@ -170,11 +182,44 @@ impl<'ctx> Compiler<'ctx> {
                     let result = self.builder.build_int_signed_div(lhs, rhs, "div").unwrap();
                     value_stack.push(result.into());
                 }
+                Operator::I32RemS => {
+                    let rhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let lhs = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let result = self.builder.build_int_signed_rem(lhs, rhs, "rem").unwrap();
+                    value_stack.push(result.into());
+                }
                 Operator::LocalGet { local_index } => {
-                    let local_value = locals
+                    let local_ptr = locals
                         .get(*local_index as usize)
                         .ok_or(anyhow!("Invalid local index: {}", local_index))?;
-                    value_stack.push(*local_value);
+                    if local_ptr.is_pointer_value() {
+                        let ptr = local_ptr.into_pointer_value();
+                        let loaded = self
+                            .builder
+                            .build_load(self.context.i32_type(), ptr, "local_load")
+                            .unwrap();
+                        value_stack.push(loaded);
+                    } else {
+                        value_stack.push(*local_ptr);
+                    }
+                }
+                Operator::LocalSet { local_index } => {
+                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    let local_ptr = locals
+                        .get(*local_index as usize)
+                        .ok_or(anyhow!("Invalid local index: {}", local_index))?;
+                    if local_ptr.is_pointer_value() {
+                        let ptr = local_ptr.into_pointer_value();
+                        self.builder.build_store(ptr, value).unwrap();
+                    } else {
+                        return Err(anyhow!("Cannot set non-pointer local"));
+                    }
                 }
                 Operator::Return => {
                     if function.func_type.results().is_empty() {
@@ -221,6 +266,23 @@ impl<'ctx> Compiler<'ctx> {
                     let ptr = self.get_memory_ptr(offset, memarg.offset)?;
                     self.builder.build_store(ptr, value).unwrap();
                 }
+                Operator::I32Store8 { memarg } => {
+                    let value = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                    let offset = value_stack
+                        .pop()
+                        .ok_or(anyhow!("Stack underflow"))?
+                        .into_int_value();
+                    let ptr = self.get_memory_ptr(offset, memarg.offset)?;
+                    let value_i8 = self
+                        .builder
+                        .build_int_truncate(
+                            value.into_int_value(),
+                            self.context.i8_type(),
+                            "trunc_i8",
+                        )
+                        .unwrap();
+                    self.builder.build_store(ptr, value_i8).unwrap();
+                }
                 Operator::I64Load { memarg } => {
                     let offset = value_stack
                         .pop()
@@ -254,6 +316,47 @@ impl<'ctx> Compiler<'ctx> {
                     let result = self.grow_memory(delta)?;
                     value_stack.push(result.into());
                 }
+                Operator::Call { function_index } => {
+                    let import_count = if self.module.get_function("putchar").is_some() {
+                        1
+                    } else {
+                        0
+                    };
+
+                    if (*function_index as usize) < import_count {
+                        if *function_index == 0 && self.module.get_function("putchar").is_some() {
+                            let arg = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                            if let Some(putchar_func) = self.module.get_function("putchar") {
+                                let call_result = self
+                                    .builder
+                                    .build_call(putchar_func, &[arg.into()], "putchar")
+                                    .unwrap();
+                                if putchar_func.get_type().get_return_type().is_some() {
+                                    value_stack
+                                        .push(call_result.try_as_basic_value().left().unwrap());
+                                }
+                            }
+                        }
+                    } else {
+                        let adjusted_index = function_index - import_count as u32;
+                        let func_name = format!("func_{}", adjusted_index);
+                        if let Some(func) = self.module.get_function(&func_name) {
+                            let param_count = func.get_type().get_param_types().len();
+                            let mut args = Vec::new();
+                            for _ in 0..param_count {
+                                let arg = value_stack.pop().ok_or(anyhow!("Stack underflow"))?;
+                                args.push(arg.into());
+                            }
+                            args.reverse();
+                            let call_result = self.builder.build_call(func, &args, "call").unwrap();
+                            if func.get_type().get_return_type().is_some() {
+                                value_stack.push(call_result.try_as_basic_value().left().unwrap());
+                            }
+                        } else {
+                            return Err(anyhow!("Unknown function: {}", func_name));
+                        }
+                    }
+                }
                 _ => return Err(anyhow!("Unsupported operator: {:?}", operator)),
             }
         }
@@ -274,6 +377,13 @@ impl<'ctx> Compiler<'ctx> {
             self.builder
                 .build_call(start_func, &[], "call_start")
                 .unwrap();
+        } else {
+            let start_func_name = "_start";
+            if let Some(start_func) = self.module.get_function(start_func_name) {
+                self.builder
+                    .build_call(start_func, &[], "call_start")
+                    .unwrap();
+            }
         }
 
         let exit_code = self.context.i32_type().const_int(0, false);
@@ -363,10 +473,21 @@ impl<'ctx> Compiler<'ctx> {
         Ok(neg_one)
     }
 
+    fn declare_putchar(&self) {
+        let i32_type = self.context.i32_type();
+        let putchar_fn_type = i32_type.fn_type(&[i32_type.into()], false);
+        self.module.add_function("putchar", putchar_fn_type, None);
+    }
+
     pub fn run_main(&self) -> Result<i32> {
         type MainFunc = unsafe extern "C" fn() -> i32;
 
         unsafe {
+            if let Some(putchar_func) = self.module.get_function("putchar") {
+                self.execution_engine
+                    .add_global_mapping(&putchar_func, putchar_wrapper as *const () as usize);
+            }
+
             let main_func: inkwell::execution_engine::JitFunction<MainFunc> = self
                 .execution_engine
                 .get_function("main")
@@ -528,6 +649,7 @@ mod tests {
             functions: vec![],
             start_func_idx: None,
             memories: vec![],
+            has_putchar_import: false,
         };
 
         let result = compiler.compile_module(&module);
@@ -563,6 +685,7 @@ mod tests {
             functions: vec![],
             start_func_idx: None,
             memories: vec![memory_type],
+            has_putchar_import: false,
         };
 
         let result = compiler.compile_module(&module);

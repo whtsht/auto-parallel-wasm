@@ -28,6 +28,24 @@ fn wat_to_wasm(wat_path: &str) -> String {
     wasm_file
 }
 
+fn test_compile(wat_path: &str) {
+    let wasm_file = wat_to_wasm(wat_path);
+    let output_file = format!("/tmp/test_output_{:?}.o", std::thread::current().id());
+
+    let output = run(&["compile", &wasm_file, &output_file]);
+    assert!(output.status.success(), "Compilation should succeed");
+    assert!(
+        std::path::Path::new(&output_file).exists(),
+        "Output file should exist"
+    );
+
+    let metadata = fs::metadata(&output_file).unwrap();
+    assert!(metadata.len() > 0, "Output file should not be empty");
+
+    fs::remove_file(&wasm_file).ok();
+    fs::remove_file(&output_file).ok();
+}
+
 fn test_ir(wat_path: &str, expected_ir_path: &str) {
     let wasm_file = wat_to_wasm(wat_path);
 
@@ -47,25 +65,7 @@ fn test_ir(wat_path: &str, expected_ir_path: &str) {
     fs::remove_file(&wasm_file).ok();
 }
 
-fn test_compile(wat_path: &str) {
-    let wasm_file = wat_to_wasm(wat_path);
-    let output_file = format!("/tmp/test_output_{:?}.o", std::thread::current().id());
-
-    let output = run(&["compile", &wasm_file, &output_file]);
-    assert!(output.status.success(), "Compilation should succeed");
-    assert!(
-        std::path::Path::new(&output_file).exists(),
-        "Output file should exist"
-    );
-
-    let metadata = fs::metadata(&output_file).unwrap();
-    assert!(metadata.len() > 0, "Output file should not be empty");
-
-    fs::remove_file(&wasm_file).ok();
-    fs::remove_file(&output_file).ok();
-}
-
-fn test_jit(wat_path: &str) {
+fn test_jit(wat_path: &str, expected_output_path: &str) {
     let wasm_file = wat_to_wasm(wat_path);
 
     let output = run(&["exec", &wasm_file]);
@@ -77,6 +77,16 @@ fn test_jit(wat_path: &str) {
         );
     } else {
         assert!(output.status.success(), "JIT execution should succeed");
+
+        let actual_output = String::from_utf8_lossy(&output.stdout);
+        let expected_output =
+            fs::read_to_string(expected_output_path).expect("Failed to read expected output file");
+
+        assert_eq!(
+            actual_output.trim(),
+            expected_output.trim(),
+            "Output should match expected"
+        );
     }
 
     fs::remove_file(&wasm_file).ok();
@@ -84,21 +94,27 @@ fn test_jit(wat_path: &str) {
 
 #[test]
 fn test_e2e() {
-    let wat_files = [
-        "tests/wat/basic_arithmetic.wat",
-        "tests/wat/memory_operations.wat",
-        "tests/wat/local_variables.wat",
+    let test_cases = [
+        (
+            "tests/wat/basic_arithmetic.wat",
+            "tests/ir/basic_arithmetic.ll",
+            "tests/output/basic_arithmetic.txt",
+        ),
+        (
+            "tests/wat/memory_operations.wat",
+            "tests/ir/memory_operations.ll",
+            "tests/output/memory_operations.txt",
+        ),
+        (
+            "tests/wat/local_variables.wat",
+            "tests/ir/local_variables.ll",
+            "tests/output/local_variables.txt",
+        ),
     ];
 
-    let ir_files = [
-        "tests/ir/basic_arithmetic.ll",
-        "tests/ir/memory_operations.ll",
-        "tests/ir/local_variables.ll",
-    ];
-
-    for (wat_path, ir_path) in wat_files.iter().zip(ir_files.iter()) {
+    for (wat_path, ir_path, output_path) in test_cases.iter() {
         test_ir(wat_path, ir_path);
         test_compile(wat_path);
-        test_jit(wat_path);
+        test_jit(wat_path, output_path);
     }
 }
