@@ -1,5 +1,7 @@
 use anyhow::Result;
-use wasmparser::{FuncType, GlobalType, MemoryType, Operator, Parser, Payload, TypeRef, ValType};
+use wasmparser::{
+    FuncType, GlobalType, MemoryType, Operator, Parser, Payload, TableType, TypeRef, ValType,
+};
 
 pub struct WasmModule {
     pub functions: Vec<Function>,
@@ -7,6 +9,8 @@ pub struct WasmModule {
     pub memories: Vec<MemoryType>,
     pub has_putchar_import: bool,
     pub globals: Vec<WasmGlobal>,
+    pub tables: Vec<TableType>,
+    pub function_types: Vec<FuncType>,
 }
 
 pub struct WasmGlobal {
@@ -35,6 +39,7 @@ impl WasmModule {
         let mut memories = Vec::new();
         let mut has_putchar_import = false;
         let mut globals = Vec::new();
+        let mut tables = Vec::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
             match payload? {
@@ -90,6 +95,12 @@ impl WasmModule {
                         globals.push(WasmGlobal {
                             global_type: global.ty,
                         });
+                    }
+                }
+                Payload::TableSection(table_section) => {
+                    for table in table_section {
+                        let table = table?;
+                        tables.push(table.ty);
                     }
                 }
                 Payload::CodeSectionEntry(body) => {
@@ -282,6 +293,18 @@ impl WasmModule {
                             Operator::MemoryCopy { src_mem, dst_mem }
                         }
                         Operator::MemoryFill { mem } => Operator::MemoryFill { mem },
+                        Operator::I32Extend8S => Operator::I32Extend8S,
+                        Operator::Unreachable => Operator::Unreachable,
+                        Operator::RefNull { hty } => Operator::RefNull { hty },
+                        Operator::RefIsNull => Operator::RefIsNull,
+                        Operator::BrTable { .. } => {
+                            eprintln!("BrTable operator not fully supported yet");
+                            continue;
+                        }
+                        Operator::CallIndirect { .. } => {
+                            eprintln!("CallIndirect operator not fully supported yet");
+                            continue;
+                        }
                         _ => {
                             eprintln!("Unsupported operator: {op:?}");
                             continue;
@@ -307,6 +330,8 @@ impl WasmModule {
             memories,
             has_putchar_import,
             globals,
+            tables,
+            function_types: func_types,
         })
     }
 }

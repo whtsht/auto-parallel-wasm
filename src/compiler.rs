@@ -1722,6 +1722,11 @@ impl<'ctx> Compiler<'ctx> {
                         .context
                         .ptr_type(inkwell::AddressSpace::default())
                         .const_null();
+                    let alloca = self
+                        .builder
+                        .build_alloca(null_ptr.get_type(), "ref_slot")
+                        .unwrap();
+                    self.builder.build_store(alloca, null_ptr).unwrap();
                     value_stack.push(null_ptr.into());
                 }
                 Operator::RefIsNull => {
@@ -1735,7 +1740,39 @@ impl<'ctx> Compiler<'ctx> {
                         .builder
                         .build_int_z_extend(result, self.context.i32_type(), "ref_is_null_ext")
                         .unwrap();
+                    let alloca = self
+                        .builder
+                        .build_alloca(self.context.i32_type(), "result_slot")
+                        .unwrap();
+                    self.builder.build_store(alloca, extended).unwrap();
                     value_stack.push(extended.into());
+                }
+                Operator::I32Extend8S => {
+                    let value = Self::pop_single_value(&mut value_stack)?.into_int_value();
+                    let masked = self
+                        .builder
+                        .build_and(
+                            value,
+                            self.context.i32_type().const_int(0xFF, false),
+                            "mask_8bit",
+                        )
+                        .unwrap();
+                    let truncated = self
+                        .builder
+                        .build_int_truncate(masked, self.context.i8_type(), "trunc_i8")
+                        .unwrap();
+                    let extended = self
+                        .builder
+                        .build_int_s_extend(truncated, self.context.i32_type(), "extend8s")
+                        .unwrap();
+                    value_stack.push(extended.into());
+                }
+                Operator::Unreachable => {
+                    self.builder.build_unreachable().unwrap();
+                    let unreachable_block = self
+                        .context
+                        .append_basic_block(llvm_func, "after_unreachable");
+                    self.builder.position_at_end(unreachable_block);
                 }
                 _ => return Err(anyhow!("Unsupported operator: {:?}", operator)),
             }
@@ -2251,6 +2288,8 @@ mod tests {
             memories: vec![],
             has_putchar_import: false,
             globals: vec![],
+            tables: vec![],
+            function_types: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -2288,6 +2327,8 @@ mod tests {
             memories: vec![memory_type],
             has_putchar_import: false,
             globals: vec![],
+            tables: vec![],
+            function_types: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -3700,6 +3741,28 @@ mod tests {
             Operator::GlobalGet { global_index: 0 },
             Operator::GlobalGet { global_index: 1 },
             Operator::Drop,
+            Operator::Drop,
+            Operator::End,
+        ];
+
+        let function = create_simple_function(0, operators);
+        let result = compiler.compile_function(&function);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reference_types_operations() {
+        let context = Context::create();
+        let compiler = Compiler::new(&context, "test").unwrap();
+
+        let operators = vec![
+            Operator::RefNull {
+                hty: wasmparser::HeapType::Abstract {
+                    shared: false,
+                    ty: wasmparser::AbstractHeapType::Extern,
+                },
+            },
+            Operator::RefIsNull,
             Operator::Drop,
             Operator::End,
         ];

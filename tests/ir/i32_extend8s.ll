@@ -2,12 +2,14 @@
 source_filename = "wasm_aot"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 
+declare i32 @putchar(i32 %0)
+
 define void @_start() {
 entry:
-  %ref_slot = alloca ptr, align 8
-  store ptr null, ptr %ref_slot, align 8
-  %result_slot = alloca i32, align 4
-  store i32 1, ptr %result_slot, align 4
+  %putchar = call i32 @putchar(i32 49)
+  %putchar1 = call i32 @putchar(i32 50)
+  %putchar2 = call i32 @putchar(i32 50)
+  %putchar3 = call i32 @putchar(i32 10)
   ret void
 }
 

@@ -118,7 +118,8 @@ fn test_e2e() {
         "select_bitcount",
         "float_advanced",
         "bulk_memory",
-        // "reference_types", // TODO: Implement RefNull/RefIsNull in wasm_parser
+        "i32_extend8s",
+        "reference_types",
     ];
 
     for (wat_path, ir_path, output_path) in test_cases.into_iter().map(test_path) {
