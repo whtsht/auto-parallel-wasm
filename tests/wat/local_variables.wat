@@ -1,26 +1,29 @@
 (module
-  (func $putchar (import "" "putchar") (param i32) (result i32))
+  (import "env" "assert_eq32" (func $assert_eq32 (param i32 i32)))
+  
   (func $_start (local i32)
-    ;; Store 42 in local variable
+    ;; Test: Store 42 in local variable
     i32.const 42
     local.set 0
-    ;; Load from local variable and display
+    
+    ;; Test: Load from local variable (should be 42)
     local.get 0
-    ;; Display tens digit (42 / 10 + '0' = 4 + 48 = 52 = '4')
-    i32.const 10
-    i32.div_s
-    i32.const 48
-    i32.add
-    call $putchar
-    drop
-    ;; Display ones digit (42 % 10 + '0' = 2 + 48 = 50 = '2')
+    i32.const 42
+    call $assert_eq32
+    
+    ;; Test: Modify local variable (42 + 8 = 50)
     local.get 0
-    i32.const 10
-    i32.rem_s
-    i32.const 48
+    i32.const 8
     i32.add
-    call $putchar
-    drop
+    local.tee 0
+    i32.const 50
+    call $assert_eq32
+    
+    ;; Test: Local variable after modification (should be 50)
+    local.get 0
+    i32.const 50
+    call $assert_eq32
   )
+  
   (start 1)
 )

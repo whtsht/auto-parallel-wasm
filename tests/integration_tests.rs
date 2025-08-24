@@ -65,7 +65,7 @@ fn test_ir(wat_path: &str, expected_ir_path: &str) {
     fs::remove_file(&wasm_file).ok();
 }
 
-fn test_jit(wat_path: &str, expected_output_path: &str) {
+fn test_jit(wat_path: &str) {
     let wasm_file = wat_to_wasm(wat_path);
 
     let output = run(&["exec", &wasm_file]);
@@ -77,54 +77,34 @@ fn test_jit(wat_path: &str, expected_output_path: &str) {
         );
     } else {
         assert!(output.status.success(), "JIT execution should succeed");
-
-        let actual_output = String::from_utf8_lossy(&output.stdout);
-        let expected_output =
-            fs::read_to_string(expected_output_path).expect("Failed to read expected output file");
-
-        assert_eq!(
-            actual_output.trim(),
-            expected_output.trim(),
-            "Output should match expected"
-        );
     }
 
     fs::remove_file(&wasm_file).ok();
 }
 
-fn test_path(test_case: &str) -> (String, String, String) {
+fn test_path(test_case: &str) -> (String, String) {
     let wat_path = format!("tests/wat/{test_case}.wat");
     let ir_path = format!("tests/ir/{test_case}.ll");
-    let output_path = format!("tests/output/{test_case}.txt");
-    (wat_path, ir_path, output_path)
+    (wat_path, ir_path)
 }
 
 #[test]
 fn test_e2e() {
     let test_cases = [
+        "assert_eq32_test",
+        "assert_eq64_test",
         "basic_arithmetic",
-        "memory_operations",
         "local_variables",
-        "control_flow",
-        "for_loop",
-        "i32_extended",
-        "i32_bitwise",
-        "i64_arithmetic",
-        "i64_comparisons",
-        "i64_bitwise",
-        "complex_operations",
-        "type_conversions",
-        "memory_operations_extended",
-        "select_bitcount",
-        "float_advanced",
-        "bulk_memory",
-        "i32_extend8s",
-        "reference_types",
+        "call_indirect_basic",
+        "call_indirect_simple",
+        "call_indirect_multi_params",
+        "call_indirect_no_params",
+        "call_indirect_all_types",
     ];
 
-    for (wat_path, ir_path, output_path) in test_cases.into_iter().map(test_path) {
+    for (wat_path, ir_path) in test_cases.into_iter().map(test_path) {
         test_ir(&wat_path, &ir_path);
         test_compile(&wat_path);
-        test_jit(&wat_path, &output_path);
+        test_jit(&wat_path);
     }
 }

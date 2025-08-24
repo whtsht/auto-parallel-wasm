@@ -8,9 +8,11 @@ declare void @assert_eq64(i64 %0, i64 %1)
 
 define void @_start() {
 entry:
-  call void @assert_eq32(i32 15, i32 15)
-  call void @assert_eq32(i32 15, i32 15)
-  call void @assert_eq32(i32 15, i32 15)
+  call void @assert_eq64(i64 42, i64 42)
+  call void @assert_eq64(i64 9223372036854775807, i64 9223372036854775807)
+  call void @assert_eq64(i64 10000, i64 10000)
+  call void @assert_eq64(i64 0, i64 0)
+  call void @assert_eq64(i64 -1000, i64 -1000)
   ret void
 }
 

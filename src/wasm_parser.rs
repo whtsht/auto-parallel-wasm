@@ -7,10 +7,19 @@ pub struct WasmModule {
     pub functions: Vec<Function>,
     pub start_func_idx: Option<u32>,
     pub memories: Vec<MemoryType>,
-    pub has_putchar_import: bool,
+    pub has_assert_eq32_import: bool,
+    pub has_assert_eq64_import: bool,
+    pub import_count: u32,
     pub globals: Vec<WasmGlobal>,
     pub tables: Vec<TableType>,
     pub function_types: Vec<FuncType>,
+    pub element_segments: Vec<ElementSegment>,
+}
+
+pub struct ElementSegment {
+    pub table_index: u32,
+    pub offset: u32,
+    pub function_indices: Vec<u32>,
 }
 
 pub struct WasmGlobal {
@@ -37,9 +46,11 @@ impl WasmModule {
         let mut func_bodies = Vec::new();
         let mut import_count = 0;
         let mut memories = Vec::new();
-        let mut has_putchar_import = false;
+        let mut has_assert_eq32_import = false;
+        let mut has_assert_eq64_import = false;
         let mut globals = Vec::new();
         let mut tables = Vec::new();
+        let mut element_segments = Vec::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
             match payload? {
@@ -59,8 +70,10 @@ impl WasmModule {
                         let import = import?;
                         if matches!(import.ty, TypeRef::Func(_)) {
                             import_count += 1;
-                            if import.name == "putchar" {
-                                has_putchar_import = true;
+                            match import.name {
+                                "assert_eq32" => has_assert_eq32_import = true,
+                                "assert_eq64" => has_assert_eq64_import = true,
+                                _ => {}
                             }
                         }
                     }
@@ -101,6 +114,43 @@ impl WasmModule {
                     for table in table_section {
                         let table = table?;
                         tables.push(table.ty);
+                    }
+                }
+                Payload::ElementSection(element_section) => {
+                    for element in element_section {
+                        let element = element?;
+                        if let wasmparser::ElementKind::Active {
+                            table_index,
+                            offset_expr,
+                        } = element.kind
+                        {
+                            let mut offset = 0u32;
+                            for op in offset_expr.get_operators_reader() {
+                                if let wasmparser::Operator::I32Const { value } = op? {
+                                    offset = value as u32;
+                                    break;
+                                }
+                            }
+
+                            let mut function_indices = Vec::new();
+                            match element.items {
+                                wasmparser::ElementItems::Functions(reader) => {
+                                    for func_idx in reader {
+                                        function_indices.push(func_idx?);
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Unsupported element items type");
+                                    continue;
+                                }
+                            }
+
+                            element_segments.push(ElementSegment {
+                                table_index: table_index.unwrap_or(0),
+                                offset,
+                                function_indices,
+                            });
+                        }
                     }
                 }
                 Payload::CodeSectionEntry(body) => {
@@ -301,10 +351,13 @@ impl WasmModule {
                             eprintln!("BrTable operator not fully supported yet");
                             continue;
                         }
-                        Operator::CallIndirect { .. } => {
-                            eprintln!("CallIndirect operator not fully supported yet");
-                            continue;
-                        }
+                        Operator::CallIndirect {
+                            type_index,
+                            table_index,
+                        } => Operator::CallIndirect {
+                            type_index,
+                            table_index,
+                        },
                         _ => {
                             eprintln!("Unsupported operator: {op:?}");
                             continue;
@@ -328,10 +381,13 @@ impl WasmModule {
             functions,
             start_func_idx,
             memories,
-            has_putchar_import,
+            has_assert_eq32_import,
+            has_assert_eq64_import,
+            import_count: import_count as u32,
             globals,
             tables,
             function_types: func_types,
+            element_segments,
         })
     }
 }
@@ -351,7 +407,6 @@ mod tests {
         assert!(module.functions.is_empty());
         assert!(module.start_func_idx.is_none());
         assert!(module.memories.is_empty());
-        assert!(!module.has_putchar_import);
     }
 
     #[test]

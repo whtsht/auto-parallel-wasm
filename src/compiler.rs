@@ -14,12 +14,16 @@ use wasmparser::{Operator, ValType};
 
 use crate::wasm_parser::{Function, WasmModule};
 
-extern "C" fn putchar_wrapper(c: i32) -> i32 {
-    let byte = (c & 0xFF) as u8;
-    print!("{}", byte as char);
-    use std::io::{self, Write};
-    io::stdout().flush().unwrap();
-    c
+extern "C" fn assert_eq32_wrapper(actual: i32, expected: i32) {
+    if actual != expected {
+        panic!("assert_eq32 failed: expected {expected}, got {actual}");
+    }
+}
+
+extern "C" fn assert_eq64_wrapper(actual: i64, expected: i64) {
+    if actual != expected {
+        panic!("assert_eq64 failed: expected {expected}, got {actual}");
+    }
 }
 
 #[derive(Clone)]
@@ -43,6 +47,8 @@ pub struct Compiler<'ctx> {
     execution_engine: ExecutionEngine<'ctx>,
     memory: Option<GlobalValue<'ctx>>,
     globals: Vec<(GlobalValue<'ctx>, ValType)>,
+    function_tables: Vec<GlobalValue<'ctx>>,
+    table_sizes: Vec<u32>,
 }
 
 impl<'ctx> Compiler<'ctx> {
@@ -62,6 +68,8 @@ impl<'ctx> Compiler<'ctx> {
             execution_engine,
             memory: None,
             globals: Vec::new(),
+            function_tables: Vec::new(),
+            table_sizes: Vec::new(),
         })
     }
 
@@ -72,13 +80,32 @@ impl<'ctx> Compiler<'ctx> {
 
         self.create_globals(&wasm_module.globals)?;
 
-        if wasm_module.has_putchar_import {
-            self.declare_putchar();
+        for table in &wasm_module.tables {
+            let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
+            let table_size = table.initial as u32;
+            let table_type = ptr_type.array_type(table_size);
+
+            let table_global = self.module.add_global(
+                table_type,
+                None,
+                &format!("table_{}", self.function_tables.len()),
+            );
+            let null_initializer = table_type.const_zero();
+            table_global.set_initializer(&null_initializer);
+
+            self.function_tables.push(table_global);
+            self.table_sizes.push(table_size);
+        }
+
+        if wasm_module.has_assert_eq32_import || wasm_module.has_assert_eq64_import {
+            self.declare_assert_functions();
         }
 
         for function in &wasm_module.functions {
-            self.compile_function(function)?;
+            self.compile_function(function, &wasm_module.function_types, wasm_module)?;
         }
+
+        self.initialize_function_tables(&wasm_module.element_segments, &wasm_module.functions)?;
 
         if let Some(start_idx) = wasm_module.start_func_idx {
             self.create_main(start_idx)?;
@@ -283,7 +310,12 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
-    fn compile_function(&self, function: &Function) -> Result<FunctionValue<'ctx>> {
+    fn compile_function(
+        &self,
+        function: &Function,
+        function_types: &[wasmparser::FuncType],
+        wasm_module: &WasmModule,
+    ) -> Result<FunctionValue<'ctx>> {
         let param_types: Vec<BasicMetadataTypeEnum> = function
             .func_type
             .params()
@@ -1030,28 +1062,51 @@ impl<'ctx> Compiler<'ctx> {
                     value_stack.push(result.into());
                 }
                 Operator::Call { function_index } => {
-                    let import_count = if self.module.get_function("putchar").is_some() {
-                        1
-                    } else {
-                        0
-                    };
+                    let import_count = wasm_module.import_count;
+                    let mut assert_eq32_idx = None;
+                    let mut assert_eq64_idx = None;
+                    let mut current_idx = 0u32;
 
-                    if (*function_index as usize) < import_count {
-                        if *function_index == 0 && self.module.get_function("putchar").is_some() {
-                            let arg = Self::pop_single_value(&mut value_stack)?;
-                            if let Some(putchar_func) = self.module.get_function("putchar") {
-                                let call_result = self
-                                    .builder
-                                    .build_call(putchar_func, &[arg.into()], "putchar")
+                    if wasm_module.has_assert_eq32_import {
+                        assert_eq32_idx = Some(current_idx);
+                        current_idx += 1;
+                    }
+                    if wasm_module.has_assert_eq64_import {
+                        assert_eq64_idx = Some(current_idx);
+                        #[allow(unused_assignments)]
+                        {
+                            current_idx += 1;
+                        }
+                    }
+
+                    if *function_index < import_count {
+                        if Some(*function_index) == assert_eq32_idx {
+                            let expected = Self::pop_single_value(&mut value_stack)?;
+                            let actual = Self::pop_single_value(&mut value_stack)?;
+                            if let Some(assert_func) = self.module.get_function("assert_eq32") {
+                                self.builder
+                                    .build_call(
+                                        assert_func,
+                                        &[actual.into(), expected.into()],
+                                        "assert_eq32",
+                                    )
                                     .unwrap();
-                                if putchar_func.get_type().get_return_type().is_some() {
-                                    value_stack
-                                        .push(call_result.try_as_basic_value().left().unwrap());
-                                }
+                            }
+                        } else if Some(*function_index) == assert_eq64_idx {
+                            let expected = Self::pop_single_value(&mut value_stack)?;
+                            let actual = Self::pop_single_value(&mut value_stack)?;
+                            if let Some(assert_func) = self.module.get_function("assert_eq64") {
+                                self.builder
+                                    .build_call(
+                                        assert_func,
+                                        &[actual.into(), expected.into()],
+                                        "assert_eq64",
+                                    )
+                                    .unwrap();
                             }
                         }
                     } else {
-                        let adjusted_index = function_index - import_count as u32;
+                        let adjusted_index = function_index - import_count;
                         let func_name = format!("func_{adjusted_index}");
                         if let Some(func) = self.module.get_function(&func_name) {
                             let param_count = func.get_type().get_param_types().len();
@@ -1068,6 +1123,110 @@ impl<'ctx> Compiler<'ctx> {
                         } else {
                             return Err(anyhow!("Unknown function: {}", func_name));
                         }
+                    }
+                }
+                Operator::CallIndirect {
+                    type_index,
+                    table_index,
+                } => {
+                    let func_idx = Self::pop_single_value(&mut value_stack)?.into_int_value();
+
+                    if (*table_index as usize) >= self.function_tables.len()
+                        || (*type_index as usize) >= function_types.len()
+                    {
+                        self.builder.build_unreachable().unwrap();
+                    } else {
+                        let func_type = &function_types[*type_index as usize];
+                        let table = self.function_tables[*table_index as usize];
+                        let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
+                        let i32_type = self.context.i32_type();
+
+                        let table_size = self.table_sizes[*table_index as usize];
+                        let bounds_check = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::ULT,
+                                func_idx,
+                                i32_type.const_int(table_size as u64, false),
+                                "bounds_check",
+                            )
+                            .unwrap();
+
+                        let valid_block = self.context.append_basic_block(llvm_func, "valid_call");
+                        let trap_block = self.context.append_basic_block(llvm_func, "trap");
+                        let after_block = self.context.append_basic_block(llvm_func, "after_call");
+
+                        self.builder
+                            .build_conditional_branch(bounds_check, valid_block, trap_block)
+                            .unwrap();
+
+                        self.builder.position_at_end(trap_block);
+                        self.builder.build_unreachable().unwrap();
+
+                        self.builder.position_at_end(valid_block);
+
+                        let table_ptr = table.as_pointer_value();
+                        let func_ptr_ptr = unsafe {
+                            self.builder
+                                .build_gep(
+                                    ptr_type.array_type(table_size),
+                                    table_ptr,
+                                    &[i32_type.const_zero(), func_idx],
+                                    "func_ptr_ptr",
+                                )
+                                .unwrap()
+                        };
+
+                        let func_ptr = self
+                            .builder
+                            .build_load(ptr_type, func_ptr_ptr, "func_ptr")
+                            .unwrap()
+                            .into_pointer_value();
+
+                        let null_check =
+                            self.builder.build_is_null(func_ptr, "null_check").unwrap();
+                        let call_block = self.context.append_basic_block(llvm_func, "do_call");
+
+                        self.builder
+                            .build_conditional_branch(null_check, trap_block, call_block)
+                            .unwrap();
+
+                        self.builder.position_at_end(call_block);
+
+                        let mut args = Vec::new();
+                        for param_type in func_type.params().iter().rev() {
+                            let arg = Self::pop_single_value(&mut value_stack)?;
+                            let converted_arg = match param_type {
+                                ValType::I32 => arg.into_int_value().into(),
+                                ValType::I64 => arg.into_int_value().into(),
+                                ValType::F32 => arg.into_float_value().into(),
+                                ValType::F64 => arg.into_float_value().into(),
+                                _ => {
+                                    return Err(anyhow!(
+                                        "Unsupported parameter type: {param_type:?}"
+                                    ));
+                                }
+                            };
+                            args.push(converted_arg);
+                        }
+                        args.reverse();
+
+                        let call_type = self.create_llvm_function_type(func_type);
+                        let call_result = self
+                            .builder
+                            .build_indirect_call(call_type, func_ptr, &args, "indirect_call")
+                            .unwrap();
+
+                        if !func_type.results().is_empty() {
+                            if let Some(result) = call_result.try_as_basic_value().left() {
+                                value_stack.push(result);
+                            }
+                        }
+
+                        self.builder
+                            .build_unconditional_branch(after_block)
+                            .unwrap();
+                        self.builder.position_at_end(after_block);
                     }
                 }
                 Operator::If { .. } => {
@@ -2000,6 +2159,26 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
+    fn create_llvm_function_type(
+        &self,
+        func_type: &wasmparser::FuncType,
+    ) -> inkwell::types::FunctionType<'ctx> {
+        let param_types: Vec<BasicMetadataTypeEnum> = func_type
+            .params()
+            .iter()
+            .map(|vt| self.val_type_to_llvm_type(*vt).into())
+            .collect();
+
+        if func_type.results().is_empty() {
+            self.context.void_type().fn_type(&param_types, false)
+        } else if func_type.results().len() == 1 {
+            let return_type = self.val_type_to_llvm_type(func_type.results()[0]);
+            return_type.fn_type(&param_types, false)
+        } else {
+            panic!("Multiple return values not supported");
+        }
+    }
+
     fn create_globals(&mut self, globals: &[crate::wasm_parser::WasmGlobal]) -> Result<()> {
         for (idx, global) in globals.iter().enumerate() {
             let global_type = global.global_type;
@@ -2043,6 +2222,41 @@ impl<'ctx> Compiler<'ctx> {
         memory_global.set_initializer(&zero_initializer);
 
         self.memory = Some(memory_global);
+        Ok(())
+    }
+
+    fn initialize_function_tables(
+        &mut self,
+        element_segments: &[crate::wasm_parser::ElementSegment],
+        functions: &[crate::wasm_parser::Function],
+    ) -> Result<()> {
+        for element_segment in element_segments {
+            if (element_segment.table_index as usize) < self.function_tables.len() {
+                let table = self.function_tables[element_segment.table_index as usize];
+                let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
+
+                let mut function_ptrs = Vec::new();
+                for &func_idx in &element_segment.function_indices {
+                    if let Some(function) = functions.iter().find(|f| f.idx == func_idx) {
+                        let function_name = format!("func_{}", function.idx);
+                        if let Some(func_value) = self.module.get_function(&function_name) {
+                            let func_ptr = func_value.as_global_value().as_pointer_value();
+                            function_ptrs.push(func_ptr);
+                        } else {
+                            function_ptrs.push(ptr_type.const_null());
+                        }
+                    } else {
+                        function_ptrs.push(ptr_type.const_null());
+                    }
+                }
+
+                if !function_ptrs.is_empty() {
+                    let array_value = ptr_type.const_array(&function_ptrs);
+                    table.set_initializer(&array_value);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2104,19 +2318,36 @@ impl<'ctx> Compiler<'ctx> {
         Ok(neg_one)
     }
 
-    fn declare_putchar(&self) {
+    fn declare_assert_functions(&self) {
         let i32_type = self.context.i32_type();
-        let putchar_fn_type = i32_type.fn_type(&[i32_type.into()], false);
-        self.module.add_function("putchar", putchar_fn_type, None);
+        let i64_type = self.context.i64_type();
+        let void_type = self.context.void_type();
+
+        let assert_eq32_fn_type = void_type.fn_type(&[i32_type.into(), i32_type.into()], false);
+        self.module
+            .add_function("assert_eq32", assert_eq32_fn_type, None);
+
+        let assert_eq64_fn_type = void_type.fn_type(&[i64_type.into(), i64_type.into()], false);
+        self.module
+            .add_function("assert_eq64", assert_eq64_fn_type, None);
     }
 
     pub fn run_main(&self) -> Result<i32> {
         type MainFunc = unsafe extern "C" fn() -> i32;
 
         unsafe {
-            if let Some(putchar_func) = self.module.get_function("putchar") {
-                self.execution_engine
-                    .add_global_mapping(&putchar_func, putchar_wrapper as *const () as usize);
+            if let Some(assert_eq32_func) = self.module.get_function("assert_eq32") {
+                self.execution_engine.add_global_mapping(
+                    &assert_eq32_func,
+                    assert_eq32_wrapper as *const () as usize,
+                );
+            }
+
+            if let Some(assert_eq64_func) = self.module.get_function("assert_eq64") {
+                self.execution_engine.add_global_mapping(
+                    &assert_eq64_func,
+                    assert_eq64_wrapper as *const () as usize,
+                );
             }
 
             let main_func: inkwell::execution_engine::JitFunction<MainFunc> = self
@@ -2215,7 +2446,19 @@ mod tests {
         let compiler = Compiler::new(&context, "test").unwrap();
 
         let function = create_simple_function(0, vec![Operator::End]);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2231,7 +2474,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2249,7 +2504,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2273,7 +2540,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2286,10 +2565,13 @@ mod tests {
             functions: vec![],
             start_func_idx: None,
             memories: vec![],
-            has_putchar_import: false,
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
             globals: vec![],
             tables: vec![],
             function_types: vec![],
+            element_segments: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -2304,7 +2586,19 @@ mod tests {
         let operators = vec![Operator::I32Add, Operator::End];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_err());
     }
 
@@ -2325,10 +2619,13 @@ mod tests {
             functions: vec![],
             start_func_idx: None,
             memories: vec![memory_type],
-            has_putchar_import: false,
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
             globals: vec![],
             tables: vec![],
             function_types: vec![],
+            element_segments: vec![],
         };
 
         let result = compiler.compile_module(&module);
@@ -2369,7 +2666,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2395,7 +2704,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2412,7 +2733,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2434,7 +2767,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2468,7 +2813,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2490,7 +2847,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2520,7 +2889,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2555,7 +2936,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2595,7 +2988,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2625,7 +3030,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2659,7 +3076,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2682,7 +3111,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2707,7 +3148,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2745,7 +3198,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2799,7 +3264,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2851,7 +3328,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2913,7 +3402,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2943,7 +3444,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -2977,7 +3490,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3007,7 +3532,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3032,7 +3569,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3081,7 +3630,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3130,7 +3691,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3195,7 +3768,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3260,7 +3845,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3279,7 +3876,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3299,7 +3908,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3325,7 +3946,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3359,7 +3992,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3383,7 +4028,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3406,7 +4063,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3427,7 +4096,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3469,7 +4150,19 @@ mod tests {
             ];
 
             let function = create_simple_function(0, operators);
-            let result = compiler.compile_function(&function);
+            let module = WasmModule {
+                functions: vec![],
+                start_func_idx: None,
+                memories: vec![],
+                has_assert_eq32_import: false,
+                has_assert_eq64_import: false,
+                import_count: 0,
+                globals: vec![],
+                tables: vec![],
+                function_types: vec![],
+                element_segments: vec![],
+            };
+            let result = compiler.compile_function(&function, &[], &module);
             assert!(result.is_ok());
         }
     }
@@ -3504,7 +4197,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3548,7 +4253,19 @@ mod tests {
             ];
 
             let function = create_simple_function(0, operators);
-            let result = compiler.compile_function(&function);
+            let module = WasmModule {
+                functions: vec![],
+                start_func_idx: None,
+                memories: vec![],
+                has_assert_eq32_import: false,
+                has_assert_eq64_import: false,
+                import_count: 0,
+                globals: vec![],
+                tables: vec![],
+                function_types: vec![],
+                element_segments: vec![],
+            };
+            let result = compiler.compile_function(&function, &[], &module);
             assert!(result.is_ok());
         }
     }
@@ -3592,7 +4309,19 @@ mod tests {
             ];
 
             let function = create_simple_function(0, operators);
-            let result = compiler.compile_function(&function);
+            let module = WasmModule {
+                functions: vec![],
+                start_func_idx: None,
+                memories: vec![],
+                has_assert_eq32_import: false,
+                has_assert_eq64_import: false,
+                import_count: 0,
+                globals: vec![],
+                tables: vec![],
+                function_types: vec![],
+                element_segments: vec![],
+            };
+            let result = compiler.compile_function(&function, &[], &module);
             assert!(result.is_ok());
         }
     }
@@ -3627,7 +4356,19 @@ mod tests {
         ];
 
         let function_f32 = create_simple_function(0, operators_f32);
-        let result = compiler.compile_function(&function_f32);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function_f32, &[], &module);
         assert!(result.is_ok());
 
         let operators_f64 = vec![
@@ -3638,7 +4379,19 @@ mod tests {
         ];
 
         let function_f64 = create_simple_function(1, operators_f64);
-        let result = compiler.compile_function(&function_f64);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function_f64, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3678,7 +4431,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3702,7 +4467,19 @@ mod tests {
         let mut function = create_simple_function(0, operators);
         function.body.locals = vec![ValType::I32, ValType::I32];
 
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3746,7 +4523,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 
@@ -3768,7 +4557,19 @@ mod tests {
         ];
 
         let function = create_simple_function(0, operators);
-        let result = compiler.compile_function(&function);
+        let module = WasmModule {
+            functions: vec![],
+            start_func_idx: None,
+            memories: vec![],
+            has_assert_eq32_import: false,
+            has_assert_eq64_import: false,
+            import_count: 0,
+            globals: vec![],
+            tables: vec![],
+            function_types: vec![],
+            element_segments: vec![],
+        };
+        let result = compiler.compile_function(&function, &[], &module);
         assert!(result.is_ok());
     }
 }
